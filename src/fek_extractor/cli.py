@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any
 
 from .core import extract_pdf_info
-from .io.exports import write_json, write_csv
+from .io.exports import write_csv, write_json
 
 
-def collect_pdfs(input_path: Path, recursive: bool = True) -> List[Path]:
+def collect_pdfs(input_path: Path, recursive: bool = True) -> list[Path]:
     if input_path.is_file() and input_path.suffix.lower() == ".pdf":
         return [input_path]
     if input_path.is_dir():
@@ -33,7 +33,7 @@ def main() -> None:
     if not pdfs:
         raise SystemExit("No PDFs found.")
 
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     for pdf in pdfs:
         try:
             records.append(extract_pdf_info(pdf, patterns=args.pattern))

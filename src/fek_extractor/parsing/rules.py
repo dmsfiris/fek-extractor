@@ -3,12 +3,12 @@ from __future__ import annotations
 import re
 from collections import Counter
 from statistics import median
-from typing import Dict, List, Any, Optional
+from typing import Any
 
 from .normalize import normalize_text
 
 
-def parse_text(text: str, patterns: Optional[List[str]] = None) -> Dict[str, Any]:
+def parse_text(text: str, patterns: list[str] | None = None) -> dict[str, Any]:
     """Parse raw text to structured info using regex rules and counters.
 
     Extend this with FEK-specific field extraction.
@@ -19,7 +19,7 @@ def parse_text(text: str, patterns: Optional[List[str]] = None) -> Dict[str, Any
     char_counter = Counter(text_norm)
     word_counter = Counter(w.lower() for w in words)
 
-    matches: Dict[str, List[str]] = {}
+    matches: dict[str, list[str]] = {}
     if patterns:
         for pat in patterns:
             try:

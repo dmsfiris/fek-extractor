@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import re
 import html as htmlmod
+import re
 import unicodedata
 
 

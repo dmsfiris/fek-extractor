@@ -25,4 +25,3 @@ python -m fek_extractor -i .\data\samples -o out.csv -f csv
 - `fek_extractor/parsing/` — normalization & rules
 - `fek_extractor/core.py` — orchestration
 - `fek_extractor/cli.py` — CLI interface
-

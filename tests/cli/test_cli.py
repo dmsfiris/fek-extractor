@@ -1,5 +1,7 @@
-from fek_extractor.cli import collect_pdfs
 from pathlib import Path
+
+from fek_extractor.cli import collect_pdfs
+
 
 def test_collect_pdfs(tmp_path: Path):
     (tmp_path / "a.pdf").write_bytes(b"%PDF-1.4\n")  # stub
