@@ -25,7 +25,7 @@ def collect_pdfs(input_path: Path, recursive: bool = True) -> list[Path]:
 def _load_patterns(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[str]:
     """
     Merge --pattern (repeatable) with --patterns-file (one regex per line).
-    Validate the patterns, de-duplicate, and return the final list.
+    Validate, de-duplicate, and return the final list.
     """
     user_patterns: list[str] = list(args.pattern or [])
 
@@ -110,6 +110,14 @@ def main() -> None:
         default=1,
         help="Parallel workers for folder input (default: 1 = sequential).",
     )
+    p.add_argument(
+        "--include-metrics",
+        action="store_true",
+        help=(
+            "Include metrics (length/lines/char_counts/word_counts_top/matches) "
+            "in the output. By default they are omitted."
+        ),
+    )
 
     args = p.parse_args()
 
@@ -126,12 +134,13 @@ def main() -> None:
 
     # Process
     records: list[dict[str, Any]] = []
+
     if len(pdfs) == 1 or args.jobs <= 1:
         # Sequential (safer for debugging / single file)
         for pdf in pdfs:
             records.append(_process_pdf(pdf, patterns, args.dehyphenate))
     else:
-        # Parallel over files
+        # Parallel over files; preserve input order in results
         total = len(pdfs)
         index_by_pdf = {pdf: i for i, pdf in enumerate(pdfs)}
         results_ordered: list[dict[str, Any] | None] = [None] * total
@@ -146,8 +155,25 @@ def main() -> None:
                 results_ordered[i] = fut.result()
                 print(f"[{done}/{total}] {pdf.name}")
 
-        # All slots should be filled; filter Nones and cast for mypy
+        # Filter just in case (should be fully filled)
         records = cast(list[dict[str, Any]], [r for r in results_ordered if r is not None])
+
+    # Optionally strip metrics (default: strip; include only if requested)
+    if not args.include_metrics:
+        metric_keys = {
+            "chars",
+            "words",
+            "length",
+            "num_lines",
+            "median_line_length",
+            "char_counts",
+            "word_counts_top",
+            "pattern_matches",
+            "matches",
+        }
+        for r in records:
+            for k in metric_keys:
+                r.pop(k, None)
 
     # Output
     if args.format == "json":
