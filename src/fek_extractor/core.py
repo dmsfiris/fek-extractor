@@ -9,6 +9,7 @@ from .parsing.articles import build_articles, build_toc, find_articles_in_text
 from .parsing.headers import find_fek_header_line, parse_fek_header
 from .parsing.normalize import dehyphenate_text
 from .parsing.rules import parse_text
+from .parsing.signatures import find_signatories
 from .utils.dates import parse_date_to_iso
 
 
@@ -20,11 +21,15 @@ def extract_pdf_info(
     if not pdf_path.exists():
         raise FileNotFoundError(pdf_path)
 
+    # Raw text (full-document)
     raw_text = extract_text_whole(pdf_path)
     if dehyphenate:
         raw_text = dehyphenate_text(raw_text)
 
+    # Parse generic metrics + FEK-specific fields from text
     parsed = parse_text(raw_text, patterns=patterns)
+
+    # Per-line view (layout-aware) for headers/signatures and first_5_lines preview
     lines = iter_lines_from_pdf(pdf_path)
 
     record: dict[str, Any] = {
@@ -58,5 +63,8 @@ def extract_pdf_info(
     articles_full = build_articles(raw_text)
     record["articles_full"] = articles_full
     record["toc"] = build_toc(articles_full)
+
+    # Signatories (scan near the end of the document)
+    record["signatories"] = find_signatories(lines)
 
     return record
