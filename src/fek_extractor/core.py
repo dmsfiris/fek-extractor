@@ -4,15 +4,25 @@ from pathlib import Path
 from typing import Any
 
 from .io.pdf import extract_text_whole, iter_lines_from_pdf
+from .parsing.normalize import dehyphenate_text  # <-- add this import
 from .parsing.rules import parse_text
 
 
-def extract_pdf_info(pdf_path: Path, patterns: list[str] | None = None) -> dict[str, Any]:
+def extract_pdf_info(
+    pdf_path: Path,
+    patterns: list[str] | None = None,
+    dehyphenate: bool = True,  # <-- new toggle
+) -> dict[str, Any]:
     if not pdf_path.exists():
         raise FileNotFoundError(pdf_path)
+
     raw_text = extract_text_whole(pdf_path)
+    if dehyphenate:
+        raw_text = dehyphenate_text(raw_text)  # <-- apply here
+
     parsed = parse_text(raw_text, patterns=patterns)
     lines = iter_lines_from_pdf(pdf_path)
+
     record: dict[str, Any] = {
         "path": str(pdf_path),
         "filename": pdf_path.name,
