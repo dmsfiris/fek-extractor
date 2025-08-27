@@ -1,6 +1,4 @@
-"""
-fek_extractor package.
-"""
+"""extract_greek_law package."""
 
 from .core import extract_pdf_info
 from .parsing.normalize import normalize_text

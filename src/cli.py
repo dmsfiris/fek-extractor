@@ -18,15 +18,12 @@ def collect_pdfs(input_path: Path, recursive: bool = True) -> list[Path]:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(
-        prog="fek-extractor", description="Extract structured info from FEK PDFs."
-    )
+    p = argparse.ArgumentParser(prog="extract-greek-law", description="Extract info from PDFs.")
     p.add_argument("--input", "-i", type=Path, required=True, help="PDF file or directory")
     p.add_argument("--out", "-o", type=Path, default=Path("out.json"), help="Output path")
     p.add_argument("--format", "-f", choices=["json", "csv"], default="json")
     p.add_argument("--pattern", action="append", default=None, help="Regex to capture (repeatable)")
     p.add_argument("--no-recursive", action="store_true", help="Disable directory recursion")
-
     args = p.parse_args()
 
     pdfs = collect_pdfs(args.input, recursive=not args.no_recursive)

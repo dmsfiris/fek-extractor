@@ -8,14 +8,11 @@ from .parsing.rules import parse_text
 
 
 def extract_pdf_info(pdf_path: Path, patterns: list[str] | None = None) -> dict[str, Any]:
-    """High-level extraction for a single PDF path."""
     if not pdf_path.exists():
         raise FileNotFoundError(pdf_path)
-
     raw_text = extract_text_whole(pdf_path)
     parsed = parse_text(raw_text, patterns=patterns)
     lines = iter_lines_from_pdf(pdf_path)
-
     record: dict[str, Any] = {
         "path": str(pdf_path),
         "filename": pdf_path.name,
