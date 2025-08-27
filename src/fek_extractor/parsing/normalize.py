@@ -1,66 +1,130 @@
+# src/fek_extractor/parsing/normalize.py
 from __future__ import annotations
 
-import html as htmlmod
+import html
 import re
 import unicodedata
-from collections.abc import Iterable
 
-# collapse runs of whitespace incl. non-breaking space
-_WHITESPACE_RE = re.compile(r"[\s\u00A0]+", re.UNICODE)
+# ----------------------------
+# Character classes / helpers
+# ----------------------------
 
-# hyphen-like characters that often appear at end-of-line
-_HYPHENS = {"-", "‐", "–"}  # ASCII hyphen, hyphen, non-breaking hyphen, en-dash
-_SOFT_HYPHEN = "\u00ad"  # discretionary soft hyphen
+# Greek + Latin lowercase ranges we care about for safe joins
+_GREEK_LOWER = "α-ωάέήίόύώϊΐϋΰ"
+_LATIN_LOWER = "a-z"
+_LOWER = _LATIN_LOWER + _GREEK_LOWER
 
-
-def normalize_text(s: str) -> str:
-    """Unescape HTML, normalize Unicode NFC, drop soft hyphens, collapse whitespace."""
-    s = htmlmod.unescape(s)
-    s = s.replace("\u00a0", " ")  # NBSP -> space
-    s = s.replace(_SOFT_HYPHEN, "")  # remove discretionary hyphen
-    s = unicodedata.normalize("NFC", s)
-    s = _WHITESPACE_RE.sub(" ", s).strip()
-    return s
+# Hyphen-like characters commonly seen in PDFs
+# ASCII hyphen, soft hyphen, hyphen, non-breaking hyphen
+_HYPHENS = r"\-\u00AD\u2010\u2011"
 
 
-def fix_soft_hyphens_inline(s: str) -> str:
-    """Remove discretionary soft hyphens (U+00AD) but leave normal hyphens intact."""
-    return s.replace(_SOFT_HYPHEN, "")
+# ----------------------------
+# Public API
+# ----------------------------
 
 
-def _ends_with_hyphen(line: str) -> bool:
-    line = line.rstrip()
-    return bool(line) and line[-1] in _HYPHENS
-
-
-def _starts_with_lower_alpha(s: str) -> bool:
-    """True if first non-space char is a lowercase letter (Greek or Latin)."""
-    s = s.lstrip()
-    if not s:
-        return False
-    c = s[0]
-    # .isalpha() works for Greek; compare to lowercase to check case
-    return c.isalpha() and c == c.lower()
-
-
-def dehyphenate_lines(lines: Iterable[str]) -> list[str]:
-    """Join soft-wrapped hyphenated words across *lines*.
-
-    If a line ends with a hyphen-like char and the next line starts with a lowercase letter,
-    drop the hyphen and concatenate without an extra space.
+def fix_soft_hyphens_inline(text: str) -> str:
     """
-    out: list[str] = []
-    for line in lines:
-        if out and _ends_with_hyphen(out[-1]) and _starts_with_lower_alpha(line):
-            prev = out.pop().rstrip()
-            # remove just the final hyphen char
-            merged = prev[:-1] + line.lstrip()
-            out.append(merged)
-        else:
-            out.append(line)
-    return out
+    Remove discretionary/soft hyphens (U+00AD) and join around them when they split words.
+    Safe for inline text where soft hyphens should be invisible.
+    """
+    if not text:
+        return ""
+    # Join when soft hyphen is surrounded by lowercase letters and optional spaces
+    text = re.sub(
+        rf"([{_LOWER}])\u00AD\s*([{_LOWER}])",
+        r"\1\2",
+        text,
+        flags=re.UNICODE,
+    )
+    # Drop any remaining soft hyphens
+    return text.replace("\u00ad", "")
+
+
+def normalize_text(text: str) -> str:
+    """
+    Light, lossless normalization for parsing:
+      - NFC normalize (compose diacritics),
+      - convert non-breaking space to space,
+      - unescape HTML entities (&amp; → &),
+      - collapse runs of whitespace (incl. newlines) to a single space,
+      - strip leading/trailing spaces.
+    """
+    if not text:
+        return ""
+    s = unicodedata.normalize("NFC", text)
+    s = s.replace("\u00a0", " ")  # nbsp → space
+    s = html.unescape(s)
+    s = re.sub(r"\s+", " ", s, flags=re.UNICODE)
+    return s.strip()
 
 
 def dehyphenate_text(text: str) -> str:
-    """Apply dehyphenation to a multi-line string and return a multi-line string."""
-    return "\n".join(dehyphenate_lines(text.splitlines()))
+    """
+    Join words broken by hyphenation across line breaks or spaces WITHOUT altering accents.
+
+    Examples fixed:
+      'εφαρμόζο-\\nνται'   -> 'εφαρμόζονται'
+      'εφαρμόζο-   νται'   -> 'εφαρμόζονται'
+      'επο- πτικών'        -> 'εποπτικών'
+
+    We only join when both sides are lowercase letters to avoid
+    touching true hyphens like 'ΣΠΥΡΙΔΩΝ - ΑΔΩΝΙΣ'.
+    """
+    if not text:
+        return ""
+
+    # Neutralize inline soft hyphens first
+    text = fix_soft_hyphens_inline(text)
+
+    # 1) Hyphen + optional spaces + newline + optional spaces
+    text = re.sub(
+        rf"([{_LOWER}]+)[{_HYPHENS}]\s*\n\s*([{_LOWER}])",
+        r"\1\2",
+        text,
+        flags=re.UNICODE,
+    )
+
+    # 2) Hyphen + spaces (no newline), common when a linebreak became spaces
+    text = re.sub(
+        rf"([{_LOWER}]+)[{_HYPHENS}]\s+([{_LOWER}])",
+        r"\1\2",
+        text,
+        flags=re.UNICODE,
+    )
+
+    return text
+
+
+def dehyphenate_lines(lines: list[str]) -> list[str]:
+    """
+    Line-wise variant used by some pipelines:
+    If a line ends with a hyphen-like char and the next line starts with a lowercase
+    letter, join without adding a space (drop the hyphen). No accent changes.
+
+    Example:
+      ["... μεγα-", "λο κείμενο."] -> ["... μεγαλο κείμενο."]  (accents unchanged)
+    """
+    if not lines:
+        return []
+
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        cur = lines[i]
+        if i + 1 < len(lines):
+            cur_r = cur.rstrip()
+            nxt = lines[i + 1].lstrip()
+            if (
+                cur_r
+                and cur_r[-1] in "-\u00ad\u2010\u2011"
+                and nxt
+                and re.match(rf"[{_LOWER}]", nxt, flags=re.UNICODE)
+            ):
+                out.append(cur_r[:-1] + nxt)  # drop the hyphen, concatenate
+                i += 2
+                continue
+        out.append(cur)
+        i += 1
+    return out

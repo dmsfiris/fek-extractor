@@ -1,20 +1,16 @@
 # src/fek_extractor/core.py
 from __future__ import annotations
 
+import html
 import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .constants import SCHEMA_VERSION
 from .io.pdf import extract_text_whole, iter_lines_from_pdf
-from .parsing.articles import (
-    Article,
-    ArticleIndex,
-    build_articles,
-    build_toc,
-    find_articles_in_text,
-)
+from .parsing.articles import Article, build_articles
 from .parsing.authority import find_issuing_authorities
 from .parsing.headers import find_fek_header_line, parse_fek_header
 from .parsing.normalize import dehyphenate_text
@@ -23,78 +19,222 @@ from .parsing.signatures import find_signatories
 from .parsing.subject import extract_subject
 from .utils.dates import parse_date_to_iso
 
-# ----------------------------
-# Sorting & de-dup helpers
-# ----------------------------
-
-
-def _article_idx_sort_key(a: ArticleIndex) -> tuple[int, int]:
-    """Sort lightweight article index by number, then by line position."""
-    return (a["number"], a["line_index"])
-
 
 def _article_full_sort_key(a: Article) -> tuple[int, int]:
     """Sort full article entries by number, then by start_line."""
     return (a["number"], a["start_line"])
 
 
-# Titles that look like inline references rather than true article titles.
-# Examples to ignore as titles:
-#   "του ν. 1234/2020", "του πδ. 50/2001", "... /2019", etc.
-_REF_TITLE_RE = re.compile(r"(?i)\bτου\s+(?:ν\.?|πδ\.?|π\.δ\.)\b|/\d{4}\b")
+# ----------------------------
+# Folding / normalization helpers
+# ----------------------------
 
+
+def _fold(s: str) -> str:
+    """Lowercase + strip diacritics (accent-insensitive)."""
+    s = s.lower()
+    s = unicodedata.normalize("NFD", s)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+
+# ----------------------------
+# Context (Part/Title/Chapter) helpers
+# ----------------------------
+
+_PART_RE = re.compile(r"(?i)^\s*ΜΕΡΟΣ\s+([Α-Ω])\s*(?:[.:–—-]?\s*(.*))?$")
+_TITLE_RE = re.compile(r"(?i)^\s*ΤΙΤΛΟΣ\s+([Α-Ω])\s*(?:[.:–—-]?\s*(.*))?$")
+_CHAPTER_RE = re.compile(r"(?i)^\s*ΚΕΦΑΛΑΙΟ\s+([Α-Ω])\s*(?:[.:–—-]?\s*(.*))?$")
 _ARTICLE_HEADING_ONLY_RE = re.compile(r"(?i)^\s*[ΆΑ]ρθρο\s+\d+\s*$")
 
 
-def _score_article_idx(a: ArticleIndex) -> int:
-    """
-    Score an ArticleIndex entry for de-duplication.
-    Higher is better:
-      +2 if the title is a meaningful phrase (not just "Άρθρο N")
-      -2 if the title looks like an inline reference to another law/PD
-    """
-    title = (a.get("title") or "").strip()
-    score = 0
-    if title and not _ARTICLE_HEADING_ONLY_RE.match(title):
-        score += 2
-    if _REF_TITLE_RE.search(title):
-        score -= 2
-    return score
+def _sanitize_heading_title(s: str | None) -> str | None:
+    """Drop meaningless titles like a bare prime mark."""
+    if not s:
+        return None
+    t = s.strip()
+    if not t:
+        return None
+    # If there's no Greek/Latin letter, treat as noise (e.g., just '΄')
+    if not re.search(r"[A-Za-zΑ-Ωα-ω]", t):
+        return None
+    return t
 
 
-def _dedupe_articles_index(items: list[ArticleIndex]) -> list[ArticleIndex]:
+def _find_heading_above(
+    lines: list[str],
+    start_line: int,
+    rx: re.Pattern[str],
+    scan_back: int = 60,
+) -> tuple[str | None, str | None]:
     """
-    Keep a single entry per article number.
-    Preference order:
-      1) "Meaningful" title over bare "Άρθρο N"
-      2) Non-reference titles over reference-like ones (πδ./ν. patterns)
-      3) Lower line_index as a tie-breaker (stable, often TOC title)
+    Scan up to `scan_back` lines above `start_line` and return (letter, title)
+    if a heading is found; otherwise (None, None). Robust to out-of-range.
     """
-    best: dict[int, ArticleIndex] = {}
-    best_score: dict[int, int] = {}
+    n = len(lines)
+    if n == 0:
+        return (None, None)
 
-    for a in items:
+    # Normalize and clamp start index to [0, n-1], scanning from the line above
+    try:
+        idx = int(start_line) - 1
+    except (TypeError, ValueError):
+        idx = n - 1
+    i = min(max(0, idx), n - 1)
+
+    limit = max(0, i - scan_back)
+    while i >= limit:
+        raw = lines[i].strip()
+        if raw:
+            m = rx.match(raw)
+            if m:
+                letter = m.group(1).strip() if m.group(1) else None
+                title = m.group(2).strip() if len(m.groups()) >= 2 and m.group(2) else None
+                return (letter, _sanitize_heading_title(title))
+        i -= 1
+    return (None, None)
+
+
+def _make_article_display_title(num: int, title: str) -> str:
+    """
+    Combine article number with a meaningful title; if the title looks like just
+    'Άρθρο N', return 'Άρθρο N' without suffix.
+    """
+    base = f"Άρθρο {num}"
+    if not title or _ARTICLE_HEADING_ONLY_RE.match(title):
+        return base
+    return f"{base}: {title}"
+
+
+# ----------------------------
+# Body -> HTML (UL/LI) renderer
+# ----------------------------
+
+_TOP_ITEM_RX = re.compile(r"^(\d+)[\.\)]\s+(.*)$")
+_SUB_ITEM_RX = re.compile(
+    r"""^(
+            \(?[α-ω]\)        |   # α) (optionally wrapped in () )
+            [a-z]\)           |   # a)
+            [α-ω]\.           |   # α.
+            [\-–—•]               # bullets: -, – , —, •
+        )\s+(.*)$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _drop_redundant_leading_title(body: str, art_title: str) -> str:
+    """
+    If the first non-empty line of the body is essentially the same as the article title,
+    drop it (to avoid duplicating the heading inside HTML).
+    """
+    if not art_title:
+        return body
+    want = _fold(art_title.strip())
+    if not want:
+        return body
+
+    lines = body.splitlines()
+    for i, ln in enumerate(lines):
+        t = ln.strip()
+        if not t:
+            continue
+        if _fold(t) == want:
+            # drop this line
+            return "\n".join(lines[:i] + lines[i + 1 :])
+        break
+    return body
+
+
+def _render_body_html(body: str, article_title: str = "") -> str:
+    """
+    Render article body as nested UL/LI when numbered/bulleted lists are detected.
+    Fallback to simple paragraphs if no list markers are present.
+    """
+    # Optionally remove a leading line that just repeats the article title
+    if article_title:
+        body = _drop_redundant_leading_title(body, article_title)
+
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    items: list[dict[str, Any]] = []  # each: {"text": str, "subs": [ ... ]}
+    current: dict[str, Any] | None = None
+    current_sub: dict[str, Any] | None = None
+    saw_top = False
+
+    for ln in lines:
+        m_top = _TOP_ITEM_RX.match(ln)
+        if m_top:
+            saw_top = True
+            # finalize previous item
+            current_sub = None
+            current = {"text": m_top.group(2).strip(), "subs": []}
+            items.append(current)
+            continue
+
+        m_sub = _SUB_ITEM_RX.match(ln)
+        if m_sub and current is not None:
+            current_sub = {"text": m_sub.group(2).strip(), "subs": []}
+            current["subs"].append(current_sub)
+            continue
+
+        # Continuation line
+        if current_sub is not None:
+            current_sub["text"] += " " + ln
+        elif current is not None:
+            current["text"] += " " + ln
+
+    if saw_top and items:
+        # Render as nested UL
+        def render_items(nodes: list[dict[str, Any]]) -> str:
+            out: list[str] = ["<ul>"]
+            for it in nodes:
+                out.append("<li>")
+                out.append(html.escape(it["text"]))
+                if it["subs"]:
+                    out.append(render_items(it["subs"]))
+                out.append("</li>")
+            out.append("</ul>")
+            return "".join(out)
+
+        return render_items(items)
+
+    # Fallback: simple paragraphs
+    parts = [f"<p>{html.escape(t)}</p>" for t in lines]
+    return "".join(parts)
+
+
+# ----------------------------
+# Choose the best article occurrence
+# ----------------------------
+
+
+def _best_articles_by_number(arts: list[Article]) -> dict[int, Article]:
+    """
+    For each article number, keep the best occurrence:
+      1) Max body length wins (real article vs TOC/inline)
+      2) Tie-breaker: later start_line (body headings usually appear after TOC)
+    """
+    best: dict[int, Article] = {}
+    score: dict[int, tuple[int, int]] = {}  # (body_len, start_line)
+
+    for a in arts:
         num = a["number"]
-        score = _score_article_idx(a)
+        body = (a.get("body") or "").strip()
+        body_len = len(body)
+        start = a.get("start_line", 0)
 
         if num not in best:
             best[num] = a
-            best_score[num] = score
+            score[num] = (body_len, start)
             continue
 
-        current = best[num]
-        cur_score = best_score[num]
-
-        if score > cur_score:
+        cur_len, cur_start = score[num]
+        if body_len > cur_len or (body_len == cur_len and start > cur_start):
             best[num] = a
-            best_score[num] = score
-        elif score == cur_score:
-            # tie-breaker: earlier line wins
-            if a["line_index"] < current["line_index"]:
-                best[num] = a
-                best_score[num] = score
+            score[num] = (body_len, start)
 
-    return sorted(best.values(), key=_article_idx_sort_key)
+    return best
 
 
 # ----------------------------
@@ -123,7 +263,7 @@ def extract_pdf_info(
     # Parse generic metrics + FEK-specific fields from text
     parsed = parse_text(raw_text, patterns=patterns)
 
-    # Per-line view for headers/signatures and first_5_lines preview
+    # Per-line view (layout-aware) for headers/signatures and first_5_lines preview
     lines = iter_lines_from_pdf(pdf_path)
 
     record: dict[str, Any] = {
@@ -162,17 +302,38 @@ def extract_pdf_info(
         record["issuing_authorities"] = authorities
         record["issuing_authority"] = authorities[0]
 
-    # Article index (numbers + titles + line indexes) — de-duplicated & sorted
-    articles_idx: list[ArticleIndex] = find_articles_in_text(raw_text)
-    articles_idx = _dedupe_articles_index(articles_idx)
-    record["articles"] = articles_idx
-    record["articles_count"] = len(articles_idx)
-
-    # Full articles (with bodies) — sorted; TOC from sorted list
+    # Build full articles, pick the best occurrence per number
     articles_full: list[Article] = build_articles(raw_text)
     articles_full_sorted = sorted(articles_full, key=_article_full_sort_key)
-    record["articles_full"] = articles_full_sorted
-    record["toc"] = build_toc(articles_full_sorted)
+    best_by_num = _best_articles_by_number(articles_full_sorted)
+
+    # Assemble the dict-shaped "articles"
+    articles_map: dict[str, dict[str, str | None]] = {}
+    for num, art in sorted(best_by_num.items(), key=lambda kv: kv[0]):
+        atitle = art.get("title") or ""
+        display_title = _make_article_display_title(num, atitle)
+        body = art.get("body") or ""
+        html_body = _render_body_html(body, article_title=atitle)
+
+        start_line = art.get("start_line", 0)
+        part_letter, part_title = _find_heading_above(lines, start_line, _PART_RE)
+        ttl_letter, ttl_title = _find_heading_above(lines, start_line, _TITLE_RE)
+        ch_letter, ch_title = _find_heading_above(lines, start_line, _CHAPTER_RE)
+
+        articles_map[str(num)] = {
+            "title": display_title,
+            "html": html_body,
+            "part_letter": part_letter,
+            "part_title": part_title,
+            "title_letter": ttl_letter,
+            "title_title": ttl_title,
+            "chapter_letter": ch_letter,
+            "chapter_title": ch_title,
+        }
+
+    # Only expose the dict-form articles
+    record["articles"] = articles_map
+    record["articles_count"] = len(articles_map)
 
     # Signatories (scan near the end of the document)
     record["signatories"] = find_signatories(lines, tail_scan=200)
