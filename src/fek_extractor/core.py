@@ -65,6 +65,6 @@ def extract_pdf_info(
     record["toc"] = build_toc(articles_full)
 
     # Signatories (scan near the end of the document)
-    record["signatories"] = find_signatories(lines)
+    record["signatories"] = find_signatories(lines, tail_scan=200)
 
     return record
