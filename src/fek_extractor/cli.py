@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .core import extract_pdf_info
 from .io.exports import write_csv, write_json
@@ -61,6 +62,14 @@ def _load_patterns(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     return patterns
 
 
+def _process_pdf(pdf: Path, patterns: list[str], dehyphenate: bool) -> dict[str, Any]:
+    """Top-level worker for multiprocessing on Windows."""
+    try:
+        return extract_pdf_info(pdf, patterns=patterns, dehyphenate=dehyphenate)
+    except Exception as e:  # keep going on errors
+        return {"path": str(pdf), "filename": pdf.name, "error": str(e)}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="fek-extractor",
@@ -94,6 +103,13 @@ def main() -> None:
         default=True,
         help="Join soft-wrapped hyphenated words in text (default: on).",
     )
+    p.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=1,
+        help="Parallel workers for folder input (default: 1 = sequential).",
+    )
 
     args = p.parse_args()
 
@@ -110,11 +126,28 @@ def main() -> None:
 
     # Process
     records: list[dict[str, Any]] = []
-    for pdf in pdfs:
-        try:
-            records.append(extract_pdf_info(pdf, patterns=patterns, dehyphenate=args.dehyphenate))
-        except Exception as e:  # continue on error, record it
-            records.append({"path": str(pdf), "filename": pdf.name, "error": str(e)})
+    if len(pdfs) == 1 or args.jobs <= 1:
+        # Sequential (safer for debugging / single file)
+        for pdf in pdfs:
+            records.append(_process_pdf(pdf, patterns, args.dehyphenate))
+    else:
+        # Parallel over files
+        total = len(pdfs)
+        index_by_pdf = {pdf: i for i, pdf in enumerate(pdfs)}
+        results_ordered: list[dict[str, Any] | None] = [None] * total
+
+        with ProcessPoolExecutor(max_workers=args.jobs) as ex:
+            futures = {
+                ex.submit(_process_pdf, pdf, patterns, args.dehyphenate): pdf for pdf in pdfs
+            }
+            for done, fut in enumerate(as_completed(futures), start=1):
+                pdf = futures[fut]
+                i = index_by_pdf[pdf]
+                results_ordered[i] = fut.result()
+                print(f"[{done}/{total}] {pdf.name}")
+
+        # All slots should be filled; filter Nones and cast for mypy
+        records = cast(list[dict[str, Any]], [r for r in results_ordered if r is not None])
 
     # Output
     if args.format == "json":
