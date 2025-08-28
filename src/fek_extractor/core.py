@@ -78,17 +78,32 @@ def _is_heading_or_article(line: str) -> bool:
 
 
 # ----------------------------
-# Build a heading index once
+# Build a heading index once (with multi-line titles)
 # ----------------------------
 
 Heading = tuple[int, str | None, str | None]  # (line_index, letter, title)
+
+# Greek lowercase range (incl. accented/diacritics) for a quick "upper-ish" test
+_LOWER_GR = "α-ωάέήίόύώϊΐϋΰ"
+
+
+def _is_upperish_title_line(s: str) -> bool:
+    """
+    Heuristic: consider a line a continuation of an ALL-CAPS heading if it has
+    no lowercase Greek/ASCII letters and is not another heading/article line.
+    """
+    t = s.strip()
+    if not t or _is_heading_or_article(t):
+        return False
+    # return True only if no lowercase chars are present
+    return not re.search(rf"[a-z{_LOWER_GR}]", t)
 
 
 def _index_headings(lines: list[str]) -> dict[str, list[Heading]]:
     """
     Scan the whole document and index PART/TITLE/CHAPTER headings.
-    If a heading line has no inline title, peek ahead up to 3 lines to grab
-    the next non-empty line that isn't another heading or article.
+    If a heading line has no inline title, look ahead for one; also collect
+    up to two extra ALL-CAPS continuation lines for multi-line titles.
     """
     idx: dict[str, list[Heading]] = {"part": [], "title": [], "chapter": []}
     n = len(lines)
@@ -105,10 +120,10 @@ def _index_headings(lines: list[str]) -> dict[str, list[Heading]]:
             letter = m.group(1).strip()
 
         title: str | None = None
+        title_line_idx = i
         if nidx >= 2 and m.group(2):
             title = m.group(2).strip()
-
-        if not title:
+        else:
             j = i + 1
             end = min(n, i + 4)
             while j < end:
@@ -116,8 +131,27 @@ def _index_headings(lines: list[str]) -> dict[str, list[Heading]]:
                 if t:
                     if not _is_heading_or_article(t):
                         title = t
+                        title_line_idx = j
                     break
                 j += 1
+
+        # Try to append up to two more ALL-CAPS continuation lines
+        if title:
+            j = title_line_idx + 1
+            end2 = min(n, title_line_idx + 4)
+            extras: list[str] = []
+            while j < end2:
+                t2 = lines[j].strip()
+                if not t2:
+                    break
+                if not _is_upperish_title_line(t2):
+                    break
+                extras.append(t2)
+                if len(extras) >= 2:
+                    break
+                j += 1
+            if extras:
+                title = " ".join([title] + extras)
 
         title = _sanitize_heading_title(title)
         return (i, letter, title)
