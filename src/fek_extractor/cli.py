@@ -1,11 +1,11 @@
+# src/fek_extractor/cli.py
 from __future__ import annotations
 
 import argparse
 import logging
-import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from .core import extract_pdf_info
 from .io.exports import write_csv, write_json
@@ -22,52 +22,54 @@ def collect_pdfs(input_path: Path, recursive: bool = True) -> list[Path]:
     raise FileNotFoundError(input_path)
 
 
-def _load_patterns(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[str]:
+def _process_pdf(
+    pdf: Path,
+    include_metrics: bool,
+    debug: bool,
+) -> dict[str, Any]:
     """
-    Merge --pattern (repeatable) with --patterns-file (one regex per line).
-    Validate, de-duplicate, and return the final list.
+    Worker that returns a plain dict for JSON/CSV.
+    Keeps the signature simple for ProcessPoolExecutor pickling.
     """
-    user_patterns: list[str] = list(args.pattern or [])
-
-    if args.patterns_file:
-        if not args.patterns_file.exists():
-            parser.error(f"--patterns-file not found: {args.patterns_file}")
-        content = args.patterns_file.read_text(encoding="utf-8")
-        file_rx = [
-            ln.strip()
-            for ln in content.splitlines()
-            if ln.strip() and not ln.lstrip().startswith("#")
-        ]
-        user_patterns.extend(file_rx)
-
-    # de-duplicate preserving order
-    seen: set[str] = set()
-    patterns: list[str] = []
-    for pat in user_patterns:
-        if pat not in seen:
-            seen.add(pat)
-            patterns.append(pat)
-
-    # validate regexes early
-    bad: list[tuple[str, str]] = []
-    for pat in patterns:
-        try:
-            re.compile(pat, re.UNICODE | re.IGNORECASE | re.MULTILINE)
-        except re.error as e:
-            bad.append((pat, str(e)))
-    if bad:
-        msg = "\n".join(f"  - {p!r}: {e}" for p, e in bad)
-        parser.error(f"Invalid regex in --pattern/--patterns-file:\n{msg}")
-
-    return patterns
-
-
-def _process_pdf(pdf: Path, patterns: list[str], dehyphenate: bool) -> dict[str, Any]:
-    """Top-level worker for multiprocessing on Windows."""
     try:
-        return extract_pdf_info(pdf, patterns=patterns, dehyphenate=dehyphenate)
-    except Exception as e:  # keep going on errors
+        rec = extract_pdf_info(
+            pdf,
+            include_metrics=include_metrics,
+            debug=debug,
+        )
+        return dict(rec)
+    except Exception as e:
         return {"path": str(pdf), "filename": pdf.name, "error": str(e)}
+
+
+def _articles_only_payload(records: list[dict[str, Any]]) -> Any:
+    """
+    Single PDF  -> return the articles map (dict of numeric keys).
+    Multi PDFs  -> return { filename|path : articles_map }
+    Falls back gracefully if structure isn't present.
+    """
+
+    def _pick_articles(rec: dict[str, Any]) -> Any:
+        # 1) common shape: {"articles": {...}}
+        arts = rec.get("articles")
+        if isinstance(arts, dict):
+            return arts
+        # 2) sometimes the whole record is the articles map
+        if rec and all(isinstance(k, str) and k.isdigit() for k in rec):
+            return rec
+        # 3) error passthrough
+        if "error" in rec:
+            return {"error": rec["error"]}
+        return None
+
+    if len(records) == 1:
+        return _pick_articles(records[0])
+
+    out: dict[str, Any] = {}
+    for rec in records:
+        key = rec.get("filename") or rec.get("path") or "document"
+        out[key] = _pick_articles(rec)
+    return out
 
 
 def main() -> None:
@@ -82,26 +84,14 @@ def main() -> None:
         "--pattern",
         action="append",
         default=None,
-        help="Regex to capture (repeatable). Use single quotes in PowerShell.",
-    )
-    p.add_argument(
-        "--patterns-file",
-        type=Path,
-        default=None,
-        help="Text file with one regex per line (lines starting with # are comments).",
+        help="Regex to capture (repeatable). (Currently informational.)",
     )
     p.add_argument("--no-recursive", action="store_true", help="Disable directory recursion")
     p.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set log verbosity (default: INFO).",
-    )
-    p.add_argument(
-        "--dehyphenate",
+        "--debug",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Join soft-wrapped hyphenated words in text (default: on).",
+        default=False,
+        help="Verbose PDF splitter/debug logs (use --debug / --no-debug).",
     )
     p.add_argument(
         "--jobs",
@@ -118,14 +108,18 @@ def main() -> None:
             "in the output. By default they are omitted."
         ),
     )
+    p.add_argument(
+        "--articles-only",
+        "--articles_only",
+        dest="articles_only",
+        action="store_true",
+        help="Print only the articles map (numeric keys) as JSON.",
+    )
 
     args = p.parse_args()
 
-    # Configure logging
-    get_logger().setLevel(getattr(logging, args.log_level.upper()))
-
-    # Load/validate patterns
-    patterns = _load_patterns(args, p)
+    # Configure logging level based on --debug
+    get_logger().setLevel(logging.DEBUG if args.debug else logging.INFO)
 
     # Collect PDFs
     pdfs = collect_pdfs(args.input, recursive=not args.no_recursive)
@@ -136,9 +130,9 @@ def main() -> None:
     records: list[dict[str, Any]] = []
 
     if len(pdfs) == 1 or args.jobs <= 1:
-        # Sequential (safer for debugging / single file)
+        # Sequential path
         for pdf in pdfs:
-            records.append(_process_pdf(pdf, patterns, args.dehyphenate))
+            records.append(_process_pdf(pdf, args.include_metrics, args.debug))
     else:
         # Parallel over files; preserve input order in results
         total = len(pdfs)
@@ -147,7 +141,7 @@ def main() -> None:
 
         with ProcessPoolExecutor(max_workers=args.jobs) as ex:
             futures = {
-                ex.submit(_process_pdf, pdf, patterns, args.dehyphenate): pdf for pdf in pdfs
+                ex.submit(_process_pdf, pdf, args.include_metrics, args.debug): pdf for pdf in pdfs
             }
             for done, fut in enumerate(as_completed(futures), start=1):
                 pdf = futures[fut]
@@ -155,10 +149,10 @@ def main() -> None:
                 results_ordered[i] = fut.result()
                 print(f"[{done}/{total}] {pdf.name}")
 
-        # Filter just in case (should be fully filled)
-        records = cast(list[dict[str, Any]], [r for r in results_ordered if r is not None])
+        # Drop Nones, keep order
+        records = [r for r in results_ordered if r is not None]
 
-    # Optionally strip metrics (default: strip; include only if requested)
+    # Optionally strip metrics unless requested
     if not args.include_metrics:
         metric_keys = {
             "chars",
@@ -176,6 +170,14 @@ def main() -> None:
                 r.pop(k, None)
 
     # Output
+    if args.articles_only:
+        payload = _articles_only_payload(records)
+        if args.format == "csv":
+            print("Warning: --articles-only ignores --format=csv; writing JSON.", flush=True)
+        write_json(payload, args.out)
+        print(f"Wrote articles-only JSON to {args.out}")
+        return
+
     if args.format == "json":
         write_json(records, args.out)
         print(f"Wrote JSON to {args.out}")

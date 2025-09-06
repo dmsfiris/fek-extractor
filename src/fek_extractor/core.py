@@ -1,514 +1,123 @@
 # src/fek_extractor/core.py
 from __future__ import annotations
 
-import html
 import re
-import unicodedata
-from bisect import bisect_right
-from datetime import datetime
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from .constants import SCHEMA_VERSION
-from .io.pdf import extract_text_whole, iter_lines_from_pdf
-from .parsing.articles import Article, build_articles
-from .parsing.authority import find_issuing_authorities
-from .parsing.headers import find_fek_header_line, parse_fek_header
-from .parsing.normalize import dehyphenate_text
-from .parsing.rules import parse_text
-from .parsing.signatures import find_signatories
-from .parsing.subject import extract_subject
-from .utils.dates import parse_date_to_iso
-
-
-def _article_full_sort_key(a: Article) -> tuple[int, int]:
-    """Sort full article entries by number, then by start_line."""
-    return (a["number"], a["start_line"])
-
-
-# ----------------------------
-# Folding / normalization helpers
-# ----------------------------
-
-
-def _fold(s: str) -> str:
-    """Lowercase + strip diacritics (accent-insensitive compare)."""
-    s = s.lower()
-    s = unicodedata.normalize("NFD", s)
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-
-
-# ----------------------------
-# Heading regexes / sanitation
-# ----------------------------
-
-# Accept prime-like marks after the letter; capture title if present.
-_PART_RE = re.compile(r"(?i)^\s*ΜΕΡΟΣ\s+([Α-Ω])(?:[΄’'\u2019\u0384])?\s*(?:[.:–—-]?\s*(.*))?$")
-_TITLE_RE = re.compile(r"(?i)^\s*ΤΙΤΛΟΣ\s+([Α-Ω])(?:[΄’'\u2019\u0384])?\s*(?:[.:–—-]?\s*(.*))?$")
-_CHAPTER_RE = re.compile(
-    r"(?i)^\s*ΚΕΦΑΛΑΙΟ\s+([Α-Ω])(?:[΄’'\u2019\u0384])?\s*(?:[.:–—-]?\s*(.*))?$"
-)
-
-# Article helpers: start vs. "only heading" (no trailing title content)
-_ARTICLE_START_RE = re.compile(r"(?i)^\s*[ΆΑ]ρθρο\s+(\d+)\b")
-_ARTICLE_HEADING_ONLY_RE = re.compile(r"(?i)^\s*[ΆΑ]ρθρο\s+\d+\s*[:.\-–—]?\s*$")
-_ARTICLE_PREFIX_RE = re.compile(r"(?i)^\s*[ΆΑ]ρθρο\s+(\d+)\s*[:.\-–—]?\s*")
-
-
-def _sanitize_heading_title(s: str | None) -> str | None:
-    """Drop meaningless titles like a bare prime mark or empty."""
-    if not s:
-        return None
-    t = s.strip()
-    if not t:
-        return None
-    if not re.search(r"[A-Za-zΑ-Ωα-ω]", t):
-        return None
-    return t
-
-
-def _is_heading_or_article(line: str) -> bool:
-    """Used to avoid grabbing the wrong 'next line' as a heading title."""
-    return bool(
-        _PART_RE.match(line)
-        or _TITLE_RE.match(line)
-        or _CHAPTER_RE.match(line)
-        or _ARTICLE_START_RE.match(line)
-    )
-
-
-# ----------------------------
-# Build a heading index once (with multi-line titles)
-# ----------------------------
-
-Heading = tuple[int, str | None, str | None]  # (line_index, letter, title)
-
-# Greek lowercase range (incl. accented/diacritics) for a quick "upper-ish" test
-_LOWER_GR = "α-ωάέήίόύώϊΐϋΰ"
-
-
-def _is_upperish_title_line(s: str) -> bool:
-    """
-    Heuristic: consider a line a continuation of an ALL-CAPS heading if it has
-    no lowercase Greek/ASCII letters and is not another heading/article line.
-    """
-    t = s.strip()
-    if not t or _is_heading_or_article(t):
-        return False
-    # return True only if no lowercase chars are present
-    return not re.search(rf"[a-z{_LOWER_GR}]", t)
-
-
-def _index_headings(lines: list[str]) -> dict[str, list[Heading]]:
-    """
-    Scan the whole document and index PART/TITLE/CHAPTER headings.
-    If a heading line has no inline title, look ahead for one; also collect
-    up to two extra ALL-CAPS continuation lines for multi-line titles.
-    """
-    idx: dict[str, list[Heading]] = {"part": [], "title": [], "chapter": []}
-    n = len(lines)
-
-    def capture(i: int, rx: re.Pattern[str]) -> Heading | None:
-        m = rx.match(lines[i].strip())
-        if not m:
-            return None
-
-        nidx = m.lastindex or 0
-
-        letter: str | None = None
-        if nidx >= 1 and m.group(1):
-            letter = m.group(1).strip()
-
-        title: str | None = None
-        title_line_idx = i
-        if nidx >= 2 and m.group(2):
-            title = m.group(2).strip()
-        else:
-            j = i + 1
-            end = min(n, i + 4)
-            while j < end:
-                t = lines[j].strip()
-                if t:
-                    if not _is_heading_or_article(t):
-                        title = t
-                        title_line_idx = j
-                    break
-                j += 1
-
-        # Try to append up to two more ALL-CAPS continuation lines
-        if title:
-            j = title_line_idx + 1
-            end2 = min(n, title_line_idx + 4)
-            extras: list[str] = []
-            while j < end2:
-                t2 = lines[j].strip()
-                if not t2:
-                    break
-                if not _is_upperish_title_line(t2):
-                    break
-                extras.append(t2)
-                if len(extras) >= 2:
-                    break
-                j += 1
-            if extras:
-                title = " ".join([title] + extras)
-
-        title = _sanitize_heading_title(title)
-        return (i, letter, title)
-
-    for i in range(n):
-        raw = lines[i].strip()
-        if not raw:
-            continue
-        h = capture(i, _PART_RE)
-        if h:
-            idx["part"].append(h)
-            continue
-        h = capture(i, _TITLE_RE)
-        if h:
-            idx["title"].append(h)
-            continue
-        h = capture(i, _CHAPTER_RE)
-        if h:
-            idx["chapter"].append(h)
-            continue
-
-    return idx  # lists are in ascending line order
-
-
-def _lookup_heading(index: list[Heading], start_line: int) -> tuple[str | None, str | None]:
-    """
-    Given a sorted heading list and an article start_line, find the nearest
-    heading at or before that line.
-    """
-    if not index:
-        return (None, None)
-    keys = [h[0] for h in index]
-    pos = bisect_right(keys, max(0, int(start_line))) - 1
-    if pos >= 0:
-        _, letter, title = index[pos]
-        return (letter, title)
-    return (None, None)
-
-
-# ----------------------------
-# Article title + HTML rendering
-# ----------------------------
-
-
-def _make_article_display_title(num: int, title: str) -> str:
-    base = f"Άρθρο {num}"
-    if not title or _ARTICLE_HEADING_ONLY_RE.match(title):
-        return base
-    return f"{base}: {title}"
-
-
-_TOP_ITEM_RX = re.compile(r"^(\d+)[\.\)]\s+(.*)$")
-_SUB_ITEM_RX = re.compile(
-    r"""^(
-            \(?[α-ω]\)        |   # α) optionally in parentheses
-            [a-z]\)           |   # a)
-            [α-ω]\.           |   # α.
-            [\-–—•]               # bullets: -, – , —, •
-        )\s+(.*)$""",
-    re.IGNORECASE | re.VERBOSE,
-)
-
-
-def _drop_redundant_leading_title(body: str, art_title: str) -> str:
-    """If the first non-empty body line equals the article title, drop it."""
-    if not art_title:
-        return body
-    want = _fold(art_title.strip())
-    if not want:
-        return body
-    lines = body.splitlines()
-    for i, ln in enumerate(lines):
-        t = ln.strip()
-        if not t:
-            continue
-        if _fold(t) == want:
-            return "\n".join(lines[:i] + lines[i + 1 :])
-        break
-    return body
-
-
-def _render_body_html(body: str, article_title: str = "") -> str:
-    """
-    Render article body as nested UL/LI when numbered/bulleted lists are detected.
-    Fallback to simple paragraphs if no list markers are present.
-    """
-    if article_title:
-        body = _drop_redundant_leading_title(body, article_title)
-    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    if not lines:
-        return ""
-    items: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    current_sub: dict[str, Any] | None = None
-    saw_top = False
-    for ln in lines:
-        m_top = _TOP_ITEM_RX.match(ln)
-        if m_top:
-            saw_top = True
-            current_sub = None
-            current = {"text": m_top.group(2).strip(), "subs": []}
-            items.append(current)
-            continue
-        m_sub = _SUB_ITEM_RX.match(ln)
-        if m_sub and current is not None:
-            current_sub = {"text": m_sub.group(2).strip(), "subs": []}
-            current["subs"].append(current_sub)
-            continue
-        if current_sub is not None:
-            current_sub["text"] += " " + ln
-        elif current is not None:
-            current["text"] += " " + ln
-    if saw_top and items:
-
-        def render_items(nodes: list[dict[str, Any]]) -> str:
-            out: list[str] = ["<ul>"]
-            for it in nodes:
-                out.append("<li>")
-                out.append(html.escape(it["text"]))
-                if it["subs"]:
-                    out.append(render_items(it["subs"]))
-                out.append("</li>")
-            out.append("</ul>")
-            return "".join(out)
-
-        return render_items(items)
-    parts = [f"<p>{html.escape(t)}</p>" for t in lines]
-    return "".join(parts)
-
-
-def _clean_article_prefix(text: str, num: int) -> str:
-    """Strip 'Άρθρο N:' prefix if it exists in the body heading."""
-
-    def repl(m: re.Match[str]) -> str:
-        try:
-            return "" if int(m.group(1)) == num else m.group(0)
-        except Exception:
-            return m.group(0)
-
-    s = _ARTICLE_PREFIX_RE.sub(repl, text)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _infer_article_title_from_body(body: str, num: int) -> str:
-    """
-    Use the first non-empty lines *before* the first list item (1., 1), α), -, •)
-    as the article's display title. Keep at most 120 chars.
-    """
-    if not body:
-        return ""
-    lines = [ln.strip() for ln in body.splitlines()]
-    head: list[str] = []
-    for ln in lines:
-        if not ln:
-            if head:
-                break
-            continue
-        if _TOP_ITEM_RX.match(ln) or _SUB_ITEM_RX.match(ln):
-            break
-        head.append(ln)
-        if len(head) >= 2:
-            break
-    if not head:
-        return ""
-    title_raw = " ".join(head)
-    title_raw = _clean_article_prefix(title_raw, num)
-    if not title_raw or _ARTICLE_HEADING_ONLY_RE.match(title_raw):
-        return ""
-    return re.sub(r"\s+", " ", title_raw).strip()[:120]
-
-
-# ----------------------------
-# Choose the best article occurrence
-# ----------------------------
-
-
-def _best_articles_by_number(arts: list[Article]) -> dict[int, Article]:
-    """
-    For each article number, keep the best occurrence:
-      1) Max body length wins (real article vs TOC/inline)
-      2) Tie-breaker: later start_line
-    """
-    best: dict[int, Article] = {}
-    score: dict[int, tuple[int, int]] = {}  # (body_len, start_line)
-
-    for a in arts:
-        num = a["number"]
-        body = (a.get("body") or "").strip()
-        body_len = len(body)
-        start = a.get("start_line", 0)
-
-        if num not in best:
-            best[num] = a
-            score[num] = (body_len, start)
-            continue
-
-        cur_len, cur_start = score[num]
-        if body_len > cur_len or (body_len == cur_len and start > cur_start):
-            best[num] = a
-            score[num] = (body_len, start)
-
-    return best
-
-
-# ----------------------------
-# Article line indexing (PDF view)
-# ----------------------------
-
-
-def _index_article_lines(lines: list[str]) -> dict[int, list[int]]:
-    """
-    Return {article_number: [line_index, ...]} for all 'Άρθρο N' lines scanned
-    from the PDF line view (layout-accurate).
-    """
-    found: dict[int, list[int]] = {}
-    for i, raw in enumerate(lines):
-        ln = raw.strip()
-        if not ln:
-            continue
-        m = _ARTICLE_START_RE.match(ln)
-        if not m:
-            continue
-        try:
-            num = int(m.group(1))
-        except Exception:
-            continue
-        found.setdefault(num, []).append(i)
-    return found
-
-
-# ----------------------------
-# Main extractor
-# ----------------------------
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import LTPage
+
+from .io.pdf import _iter_lines, count_pages, extract_pdf_text, infer_decision_number
+from .metrics import text_metrics
+from .parsing.articles import build_articles_map
+from .parsing.articles_norm import article_sort_key
+from .parsing.headers import parse_fek_header
+from .parsing.normalize import dehyphenate_text, normalize_text
 
 
 def extract_pdf_info(
     pdf_path: Path,
-    patterns: list[str] | None = None,
-    dehyphenate: bool = True,
+    include_metrics: bool = False,
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    if not pdf_path.exists():
-        raise FileNotFoundError(pdf_path)
+    """
+    Return FEK header fields and parsed articles from a PDF.
+    If include_metrics=True, merge basic text metrics at the top level.
+    """
+    debug: bool = bool(kwargs.get("debug", False))
 
-    # Raw text (full-document)
-    raw_text = extract_text_whole(pdf_path)
+    # 1) Extract full text (headers/footers filtered)
+    full_text: str = extract_pdf_text(pdf_path, debug=debug)
 
-    # Count pages from the original text (form-feeds intact)
-    pages = raw_text.count("\f") + 1 if raw_text else 0
+    # Precompute normalized text once (used by decision + metrics)
+    text_norm: str = normalize_text(full_text)
 
-    # Optional dehyphenation
-    if dehyphenate:
-        raw_text = dehyphenate_text(raw_text)
+    # Use de-hyphenated body only for article parsing
+    body_src: str = dehyphenate_text(full_text)
 
-    # Parse generic metrics + FEK-specific fields from text
-    parsed = parse_text(raw_text, patterns=patterns)
+    # 2) Build a light "masthead" blob from first couple of pages
+    masthead_lines: list[str] = []
+    try:
+        for i, layout in enumerate(extract_pages(str(pdf_path))):
+            if not isinstance(layout, LTPage):
+                continue
+            if i >= 2:
+                break
+            h: float = float(getattr(layout, "height", 0.0))
+            for _x0, y0, _x1, y1, txt in _iter_lines(layout):
+                if not txt:
+                    continue
+                in_band = (y1 >= 0.80 * h) or (y0 <= 0.18 * h)
+                has_token = re.search(r"(?:^|\s)(ΤΕΥΧΟΣ|ΦΕΚ)\b|Αρ\.\s*Φύλλου", txt, re.IGNORECASE)
+                if in_band or has_token:
+                    masthead_lines.append(txt)
+    except Exception:  # noqa: BLE001
+        # If masthead probing fails for any reason, proceed without it.
+        pass
 
-    # Per-line view (layout-aware) for headers/signatures and preview
-    lines = iter_lines_from_pdf(pdf_path)
+    header_source: str = ("\n".join(masthead_lines) + "\n" + full_text).strip()
 
+    # 3) FEK header fields
+    header: dict[str, str] = parse_fek_header(header_source)
+
+    # Decision number (from normalized text)
+    decision = infer_decision_number(text_norm)
+    if decision:
+        header["decision_number"] = decision
+
+    # 4) Articles (ordered)
+    articles_dict: dict[str, Any] = build_articles_map(body_src)
+    articles_ordered: OrderedDict[str, Any] = OrderedDict(
+        sorted(articles_dict.items(), key=lambda kv: article_sort_key(kv[0]))
+    )
+
+    # 5) Compose record
     record: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "extracted_at": datetime.now().isoformat(timespec="seconds"),
-        "path": str(pdf_path),
         "filename": pdf_path.name,
-        "pages": pages,
-        **parsed,
-        "first_5_lines": lines[:5],
+        "path": str(pdf_path),
+        "pages": count_pages(pdf_path),
+        **header,
+        "articles": articles_ordered,
     }
 
-    # Enrich FEK fields from header lines (top-of-page area)
-    header_line = find_fek_header_line(lines)
-    if header_line:
-        hdr = parse_fek_header(header_line)
-        for k in ("fek_series", "fek_number", "fek_date"):
-            if hdr.get(k) and not record.get(k):
-                record[k] = hdr[k]
-        if (
-            record.get("fek_date")
-            and not record.get("fek_date_iso")
-            and (iso := parse_date_to_iso(record["fek_date"]))
-        ):
-            record["fek_date_iso"] = iso
-
-    # Subject (ΘΕΜΑ): if missing from text parsing, try line-based extractor
-    if not record.get("subject"):
-        subj = extract_subject(lines)
-        if subj:
-            record["subject"] = subj
-
-    # Issuing authority (top-of-doc heuristics)
-    authorities = find_issuing_authorities(lines)
-    if authorities:
-        record["issuing_authorities"] = authorities
-        record["issuing_authority"] = authorities[0]
-
-    # Index headings once for accurate context lookup
-    heading_index = _index_headings(lines)
-
-    # Index article headings in PDF line view and compute the first body anchor
-    article_line_index = _index_article_lines(lines)
-    anchors: list[int] = []
-    for kind in ("part", "title", "chapter"):
-        if heading_index[kind]:
-            anchors.append(heading_index[kind][0][0])
-    first_body_anchor = min(anchors) if anchors else 0
-
-    # Build full articles, pick the best occurrence per number
-    articles_full: list[Article] = build_articles(raw_text)
-    articles_full_sorted = sorted(articles_full, key=_article_full_sort_key)
-    best_by_num = _best_articles_by_number(articles_full_sorted)
-
-    # Assemble the dict-shaped "articles"
-    articles_map: dict[str, dict[str, str | None]] = {}
-    for num, art in sorted(best_by_num.items(), key=lambda kv: kv[0]):
-        given_title = (art.get("title") or "").strip()
-        body = art.get("body") or ""
-
-        # Fallback from body if parser title is empty/generic
-        if not given_title or _ARTICLE_HEADING_ONLY_RE.match(given_title):
-            inferred = _infer_article_title_from_body(body, num)
-            atitle = inferred or given_title
-        else:
-            atitle = given_title
-
-        display_title = _make_article_display_title(num, atitle)
-        html_body = _render_body_html(body, article_title=atitle)
-
-        # Prefer a line-accurate article line from the PDF, skipping TOC
-        line_idx_for_num: int | None = None
-        cands = article_line_index.get(num, [])
-        if cands:
-            later = [i for i in cands if i >= first_body_anchor]
-            line_idx_for_num = (later or cands)[0]
-
-        start_line_ctx = int(
-            line_idx_for_num if line_idx_for_num is not None else art.get("start_line", 0)
-        )
-
-        part_letter, part_title = _lookup_heading(heading_index["part"], start_line_ctx)
-        ttl_letter, ttl_title = _lookup_heading(heading_index["title"], start_line_ctx)
-        ch_letter, ch_title = _lookup_heading(heading_index["chapter"], start_line_ctx)
-
-        articles_map[str(num)] = {
-            "title": display_title,
-            "html": html_body,
-            "part_letter": part_letter,
-            "part_title": part_title,
-            "title_letter": ttl_letter,
-            "title_title": ttl_title,
-            "chapter_letter": ch_letter,
-            "chapter_title": ch_title,
-        }
-
-    record["articles"] = articles_map
-    record["articles_count"] = len(articles_map)
-
-    # Signatories (scan near the end of the document)
-    record["signatories"] = find_signatories(lines, tail_scan=200)
+    # 6) Optional metrics
+    if include_metrics:
+        record.update(text_metrics(full_text, text_norm=text_norm))
 
     return record
+
+
+def extract(
+    input_path: Path,
+    include_metrics: bool = False,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """
+    Υψηλού επιπέδου API: δέχεται path σε PDF ή φάκελο με PDF και επιστρέφει λίστα από records.
+    Δέχεται και περνάει ό,τι επιπλέον kwargs (π.χ. dehyphenate) στο extract_pdf_info().
+    """
+    p = Path(input_path)
+    results: list[dict[str, Any]] = []
+
+    if p.is_file() and p.suffix.lower() == ".pdf":
+        results.append(extract_pdf_info(p, include_metrics=include_metrics, **kwargs))
+        return results
+
+    if p.is_dir():
+        for pdf in sorted(p.glob("**/*.pdf")):
+            try:
+                rec = extract_pdf_info(pdf, include_metrics=include_metrics, **kwargs)
+                results.append(rec)
+            except Exception as e:
+                results.append(
+                    {
+                        "path": str(pdf),
+                        "filename": pdf.name,
+                        "error": str(e),
+                    }
+                )
+        return results
+
+    raise FileNotFoundError(f"Not a PDF or directory: {input_path}")
