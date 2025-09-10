@@ -7,17 +7,18 @@ on:
   pull_request:
     branches: [ "master" ]
   workflow_dispatch: {}
+
 jobs:
   tests:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest ]  # add macos-latest if you want
+        os: [ ubuntu-latest, windows-latest ]   # add macos-latest if you want
         python-version: [ "3.10", "3.11", "3.12" ]
 
     env:
-      PYTHONUTF8: "1"   # stable UTF-8 across OSes
+      PYTHONUTF8: "1"  # stable UTF-8 across OSes
 
     steps:
       - name: Checkout
@@ -32,7 +33,7 @@ jobs:
             pyproject.toml
             requirements*.txt
 
-      # Optional: nudge Windows console to UTF-8 if you see garbled Greek
+      # Optional: ensure UTF-8 console on Windows (helps with Greek text)
       - name: Ensure UTF-8 codepage (Windows)
         if: runner.os == 'Windows'
         run: chcp 65001
@@ -42,11 +43,18 @@ jobs:
         run: |
           python -m pip install -U pip
           pip install ".[dev]" || pip install .
+
       - name: Lint (ruff)
         run: ruff check .
+
       - name: Format check (black)
         run: black --check .
+
       - name: Type check (mypy)
-        run: mypy src
+        run: |
+          mypy --version
+          mypy --show-config
+          mypy src --config-file pyproject.toml --pretty --show-error-codes
+
       - name: Tests
         run: pytest -q
