@@ -30,6 +30,9 @@ def extract_pdf_info(
     Return FEK header fields and parsed articles from a PDF.
     If include_metrics=True, merge basic text metrics at the top level.
     """
+    # Normalize once to a real Path (use a new local so mypy knows its type)
+    p: Path = Path(pdf_path)
+
     debug: bool = bool(kwargs.get("debug", False))
 
     # NEW: accept an optional page from kwargs (from CLI)
@@ -88,7 +91,7 @@ def extract_pdf_info(
 
     # 5) Compose record
     record: dict[str, Any] = {
-        "filename": pdf_path.name,
+        "filename": p.name,
         "path": str(pdf_path),
         "pages": count_pages(pdf_path),
         **header,
