@@ -53,7 +53,6 @@ jobs:
       - name: Type check (mypy)
         run: |
           mypy --version
-          mypy --show-config
           mypy src --config-file pyproject.toml --pretty --show-error-codes
 
       - name: Tests
