@@ -3,7 +3,7 @@ from pathlib import Path
 from fek_extractor.io.exports import write_csv, write_json
 
 
-def test_write_json_and_csv(tmp_path: Path):
+def test_write_json_and_csv(tmp_path: Path) -> None:
     records = [
         {
             "path": "x.pdf",
