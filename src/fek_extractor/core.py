@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
+from os import PathLike
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +17,12 @@ from .parsing.articles_norm import article_sort_key
 from .parsing.headers import parse_fek_header
 from .parsing.normalize import dehyphenate_text, normalize_text
 
+# Convenience alias for public API
+Pathish = str | Path | PathLike[str]
+
 
 def extract_pdf_info(
-    pdf_path: Path,
+    pdf_path: Pathish,
     include_metrics: bool = False,
     **kwargs: Any,
 ) -> dict[str, Any]:
@@ -99,7 +103,7 @@ def extract_pdf_info(
 
 
 def extract(
-    input_path: Path,
+    input_path: Pathish,
     include_metrics: bool = False,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:

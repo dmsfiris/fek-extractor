@@ -210,7 +210,7 @@ def main() -> None:
         help="Emit only the Table of Contents as JSON (array of parts).",
     )
 
-    args = p.parse_args()
+    args: argparse.Namespace = p.parse_args()
 
     # Translate --debug into (debug: bool, debug_pages: Optional[int])
     if args.debug is None:
