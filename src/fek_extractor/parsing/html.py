@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from ..utils.html_cleanup import tidy_article_html
+from .heuristics import prev_ends_connector
 from .normalize import dehyphenate_lines, fix_soft_hyphens_inline
 
 __all__ = ["lines_to_html"]
@@ -13,12 +14,20 @@ __all__ = ["lines_to_html"]
 # -----------------------------
 
 _BULLET_DASH_RE = re.compile(r"^\s*[-•]\s+(?P<text>.+)$")
-_BULLET_NUM_RE = re.compile(r"^\s*\(?(?P<num>\d{1,2})[.)]\s+(?P<text>.+)$")
+# Numeric bullets like "2)" or "2." — but NOT "(2)"
+_BULLET_NUM_RE = re.compile(r"^\s*(?P<num>\d{1,2})[.)]\s+(?P<text>.+)$")
 _BULLET_ROMAN_RE = re.compile(r"^\s*\(?(?P<rn>[ivxIVX]+)[.)]\s+(?P<text>.+)$")
 
 # Greek alpha-numeric bullets: accept *only* (α)  or  α)  or  α.
 # (Prevents false positives like "Η Εταιρεία ..." turning into a bullet.)
 _BULLET_GREEK_RE = re.compile(r"^\s*(?:\((?P<gr>[α-ω])\)|(?P<gr2>[α-ω])[.)])\s+(?P<text>.+)$")
+
+_HEADING_LIKE_RE = re.compile(
+    r"^\s*(?:ΜΕΡΟΣ|ΤΙΤΛΟΣ|ΚΕΦΑΛΑΙΟ|ΤΜΗΜΑ|ΠΑΡΑΡΤΗΜΑ|ΑΡΘΡΟ|Άρθρο)\b",
+    re.UNICODE | re.IGNORECASE,
+)
+
+_STRONG_STOP_RE = re.compile(r"[.!;:·…»)]\s*$", re.UNICODE)
 
 
 def _parse_bullet(line: str) -> tuple[str, str] | None:
@@ -148,6 +157,57 @@ class _ULTree:
         return "<ul>" + _render_items(self.levels[0]) + "</ul>"
 
 
+def _nest_paragraph_between_uls_into_prev_li(html: str) -> str:
+    """
+    Turn:
+      …<li>…</li></ul><p>P_TEXT</p><ul>…
+    into:
+      …<li>…<p>P_TEXT</p></li></ul><ul>…
+    (so the paragraph becomes part of the previous <li>)
+    Run BEFORE coalescing </ul><ul>.
+    """
+    # Match the last <li> of a UL, then a <p>, then the start of next UL.
+    # Non-greedy '.*?' keeps content local to that final LI.
+    pat: re.Pattern[str] = re.compile(
+        r"(?is)(<li\b[^>]*>.*?)(</li>\s*</ul>)" r"\s*<p>(.*?)</p>\s*(?=<ul\b)"
+    )
+    prev = None
+    while prev != html:
+        prev = html
+        html = pat.sub(lambda m: f"{m.group(1)}{(m.group(3) or '').strip()}{m.group(2)}", html)
+    return html
+
+
+def _merge_soft_paragraph_breaks(html: str) -> str:
+    """
+    Merge mid-sentence </p><p> only when:
+      - left paragraph does NOT end with strong punctuation, and
+      - right paragraph looks like a continuation,
+      - and neither side is a heading per _HEADING_LIKE_RE.
+    """
+    pat: re.Pattern[str] = re.compile(r"(?is)<p>(.*?)</p>\s*<p>(.*?)</p>")
+
+    def repl(m: re.Match[str]) -> str:
+        a = (m.group(1) or "").strip()
+        b = (m.group(2) or "").strip()
+        if not a or not b:
+            return m.group(0)
+
+        # use your existing heading detector
+        if _HEADING_LIKE_RE.match(a) or _HEADING_LIKE_RE.match(b):
+            return m.group(0)
+
+        if not _STRONG_STOP_RE.search(a) and _looks_like_li_continuation(b):
+            return f"<p>{a} {b}</p>"
+        return m.group(0)
+
+    prev: str | None = None
+    while prev != html:
+        prev = html
+        html = pat.sub(repl, html)
+    return html
+
+
 # -----------------------------
 # Public API
 # -----------------------------
@@ -194,13 +254,13 @@ def lines_to_html(lines: list[str]) -> str:
     while i < n:
         raw = lines[i]
         i += 1
-
-        if not (raw or "").strip():
+        s = (raw or "").strip()
+        if not s:
             # blank line: end paragraph
             flush_paragraph()
             continue
 
-        parsed = _parse_bullet(raw)
+        parsed = _parse_bullet(s)
         if parsed:
             # new bullet item — close any paragraph first
             flush_paragraph()
@@ -238,23 +298,41 @@ def lines_to_html(lines: list[str]) -> str:
             continue
 
         # Non-bullet line
-        if current_list is not None and _looks_like_li_continuation(raw):
-            # append continuation text to the last <li>
-            current_list.append_to_last(raw)
-            continue
+        if current_list is not None:
+            last = current_list.last_item()
+            # 1) classic continuation (lowercase/punct/paren/numeric tail)
+            if _looks_like_li_continuation(s):
+                current_list.append_to_last(s)
+                continue
+            # 2) generic continuation gated by language heuristic
+            if last and prev_ends_connector(last.text) and not _HEADING_LIKE_RE.match(s):
+                current_list.append_to_last(s)
+                continue
+            # 3) otherwise: NOT a continuation → close the list, keep this as paragraph
+            flush_list()
+            if current_paragraph is None:
+                current_paragraph = s
+            else:
+                current_paragraph += " " + s
+            continue  # important: we've handled this line
 
         # Plain paragraph text
         flush_list()
         if current_paragraph is None:
-            current_paragraph = raw.strip()
+            current_paragraph = s
         else:
-            current_paragraph += " " + raw.strip()
+            current_paragraph += " " + s
 
     # Flush any trailing constructs
     flush_paragraph()
     flush_list()
 
     html = "".join(blocks)
+
+    html = _merge_soft_paragraph_breaks(html)
+
+    # NEW: keep 'Υπάγεται …' as a paragraph but inside the last <li>
+    html = _nest_paragraph_between_uls_into_prev_li(html)
 
     # Coalesce adjacent <ul> blocks created by blank lines between list chunks
     # (Avoids <ul>..</ul><ul>..</ul> when logically one list)

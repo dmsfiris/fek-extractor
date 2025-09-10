@@ -610,7 +610,7 @@ def _is_complete_sentence(s: str) -> bool:
 
 
 _STRUCTURAL_TOKENS_RX: Final[re.Pattern[str]] = re.compile(
-    r"\b(ΜΕΡΟΣ|ΚΕΦΑΛΑΙΟ|ΤΜΗΜΑ)\b", re.UNICODE
+    r"\b(ΜΕΡΟΣ|ΤΙΤΛΟΣ|ΚΕΦΑΛΑΙΟ|ΤΜΗΜΑ)\b", re.UNICODE
 )
 
 

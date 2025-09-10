@@ -2,22 +2,37 @@
 """
 PDF text extraction with robust 2-column detection, safe single-column tail
 (after columns), ET Gazette header/footer filtering, Greek de-hyphenation,
-article heading clustering, and smart tail trimming:
-- Trim from the first proclamation onward, OR
-- If no proclamation, trim from the first signature/date/seal/ALL-CAPS block
-  that appears after the last article block on the page, OR
-- From a standalone ANNEX heading ("ΠΑΡΑΡΤΗΜΑ", optionally with Roman numeral)
-  that appears after the last article block on the page.
-- After we hit that end-of-document anchor on any page, drop ALL subsequent pages.
+article heading clustering, and smart tail trimming.
 
-Public API (backward-compatible):
-    - extract_text_whole(path: str | os.PathLike, debug: bool = False) -> str
-    - count_pages(pdf_path: _PathLike) -> int
-    - infer_decision_number(text_norm: str) -> str | None
+Key behaviors:
+- Two-column split via k-means + vertical occupancy valley.
+- Tail zone = anything physically *below* both columns' bottoms (strict).
+- Demotions that send lines from columns to the single-column tail:
+    • Article-switch by WIDTH change: for each new "Άρθρο N" in a column,
+      if one of the next 3 lines crosses the split (becomes full-width), we
+      demote from that head downward to the tail (column ended).
+    • "Unfinished sentence → new article" (guarded): same demotion, but only
+      when we've already entered the articles body (avoids TOC false positives).
+    • Strict article-gap demotion within a column (e.g., 60 → 62 while 61 is
+      not on this page and not seen before) — demote from 62 downward.
+- Trim end-of-document from the first proclamation/signature/date/seal line
+  that appears *after* the last article block on the page OR from an ANNEX
+  heading (ΠΑΡΑΡΤΗΜΑ ...). When such a terminal anchor is hit on a page,
+  all subsequent pages are dropped.
+- Single debug page or set of pages via `debug_pages`.
+  NOTE: if you pass an **int**, it is treated as 1-based (human page number).
+        if you pass a **set[int]**, those are treated as 0-based indices.
+
+Public API:
+    - extract_text_whole(path, debug=False, debug_pages: int|set[int]|None=None) -> str
+    - extract_pdf_text(path, debug=False, debug_pages: int|set[int]|None=None) -> str
+    - count_pages(pdf_path) -> int
+    - infer_decision_number(text_norm) -> str|None
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -109,6 +124,8 @@ _SITE_RE = re.compile(r"(www\.et\.gr|helpdesk\.et@et\.gr|webmaster\.et@et\.gr)",
 _CONTACT_RE = re.compile(r"(Καποδιστρίου|ΤΗΛΕΦΩΝΙΚΟ\s+ΚΕΝΤΡΟ|ΕΞΥΠΗΡΕΤΗΣΗ\s+ΚΟΙΝΟΥ)", re.IGNORECASE)
 # bare page number like "3007"
 _PAGE_NUM_RE = re.compile(r"^\s*\d{3,5}\s*$")
+# Barcode-like footer lines (π.χ. *01001951708070040*)
+_BARCODE_RE = re.compile(r"^\s*\*?\s*\d{12,}\s*\*?\s*$")
 
 # FEK page counters like "4180−6" that use non-ASCII dashes (en/em/minus/etc.)
 _NONASCII_DASHES = "\u2012\u2013\u2014\u2212\u2010\u2011"
@@ -131,6 +148,10 @@ def _is_header_footer_line(line: Line, _page_w: float, page_h: float) -> bool:
     if _ET_GAZETTE_RE.search(ts) or ("ΕΦΗΜΕΡΙ" in ts and "ΚΥΒΕΡΝΗΣ" in ts):
         return True
 
+    # NEW: barcode-like lines (συνήθως κάτω-κάτω)
+    if _BARCODE_RE.match(ts):
+        return True
+
     # Generous bands (headers often sit deeper than 93%)
     top_band = (y1 >= 0.88 * page_h) or (y0 >= 0.86 * page_h)
     bot_band = (y0 <= 0.12 * page_h) or (y1 <= 0.14 * page_h)
@@ -143,8 +164,6 @@ def _is_header_footer_line(line: Line, _page_w: float, page_h: float) -> bool:
         return True
     if _CONTACT_RE.search(ts):
         return True
-    # Old: return bool(_PAGE_NUM_RE.match(ts))
-    # New: also accept FEK counters like "4180−6"
     return bool(_PAGE_NUM_RE.match(ts) or _PAGE_COUNTER_RE.match(ts))
 
 
@@ -294,7 +313,6 @@ class SplitSmoother:
 
     window: int = 7
     store: dict[tuple[int, int, int], deque[float]] = field(
-        # Use a normal deque at runtime; the annotation carries the value type.
         default_factory=lambda: defaultdict(lambda: deque(maxlen=7))
     )
 
@@ -333,6 +351,7 @@ class PageContext:
     width: float
     height: float
     rotation: int = 0
+    page_count: int | None = None
 
 
 ARTICLE_HEAD_RE = re.compile(r"^\s*Άρθρο\s+\d+\b", re.IGNORECASE)
@@ -342,48 +361,37 @@ PROCLAIM_RE = re.compile(r"^\s*(Παραγγέλλ(?:ο|ου)με|Διατάσσ
 
 # Signature/date/seal anchors (when proclamation absent)
 SIGNATURE_HEADER_RE = re.compile(
-    r"^\s*(Οι\s+Υπουργοί|Ο\s+Υπουργός|Η\s+Υπουργός|Η\s+Πρόεδρος(?:\s+της\s+Δημοκρατίας)?|Ο\s+Πρόεδρος)\b",
-    re.IGNORECASE,
+    r"^(?!.*[a-z\u03b1-\u03c9\u1F00-\u1FFF])\s*(?:"
+    r"ΟΙ?\s+ΥΠΟΥΡΓΟΙ|"
+    r"Ο\s+ΠΡΟΕΔΡΟΣ(?:\s+ΤΗΣ\s+ΔΗΜΟΚΡΑΤΙΑΣ)?|"
+    r"Η\s+ΠΡΟΕΔΡΟΣ(?:\s+ΤΗΣ\s+ΔΗΜΟΚΡΑΤΙΑΣ)?|"
+    r"Ο\s+ΥΠΟΥΡΓΟΣ|"
+    r"Η\s+ΥΠΟΥΡΓΟΣ|"
+    r"ΑΠΟ\s+ΤΟ\s+ΕΘΝΙΚΟ\s+ΤΥΠΟΓΡΑΦΕΙΟ"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
 )
-DATE_LINE_RE = re.compile(r"^\s*Αθήνα,\s*\d{1,2}\s+[\u0370-\u03FF\u1F00-\u1FFF]+\s+\d{4}\b")
+DATE_LINE_RE = re.compile(
+    r"^\s*(?:Αθήνα|ΑΘΗΝΑ),?\s*\d{1,2}(?:η|ης)?\s+[\u0370-\u03FF\u1F00-\u1FFF]+\s+\d{4}\b"
+)
 SEAL_LINE_RE = re.compile(r"^\s*Θεωρήθηκε\s+και\s+τέθηκε", re.IGNORECASE)
 
-# ALL-CAPS (Greek) name-ish line (very common in signatures)
-UPPER_GREEK_NAME_RE = re.compile(r"^[\u0386-\u03AB]{2,}(?:[\s\-–][\u0386-\u03AB]{2,})+$")
+# Inline variants for trimming
+DATE_INLINE_RE = re.compile(
+    r"(?:^|[.\u00B7;,\s])(?:Αθήνα|ΑΘΗΝΑ),?\s*\d{1,2}(?:η|ης)?\s+[\u0370-\u03FF\u1F00-\u1FFF]+\s+\d{4}\b"
+)
+SIGNATURE_INLINE_RE = re.compile(
+    r"\b(?:ΟΙ?\s+ΥΠΟΥΡΓΟΙ|Ο\s+ΠΡΟΕΔΡΟΣ(?:\s+ΤΗΣ\s+ΔΗΜΟΚΡΑΤΙΑΣ)?|Η\s+ΠΡΟΕΔΡΟΣ(?:\s+ΤΗΣ\s+ΔΗΜΟΚΡΑΤΙΑΣ)?)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+SEAL_INLINE_RE = re.compile(r"Θεωρήθηκε\s+και\s+τέθηκε", re.IGNORECASE | re.UNICODE)
 
-# ---------------------- ANNEX (ΠΑΡΑΡΤΗΜΑ) detection ------------------------ #
-# Any lowercase (Latin or Greek)
-LOWER_ANY_RE = re.compile(r"[a-z\u03B1-\u03C9\u1F00-\u1FFF]")
-
-# Standalone structural heading: only “ΠΑΡΑΡΤΗΜΑ”
-# Roman numerals: Latin IVXLCDM, Greek lookalikes Ι (iota), Χ (chi),
-# and Unicode Roman numerals range (Ⅰ–Ⅿ, ⅰ–ⅿ)
-_ROMAN_CLASS = r"(?:[IVXLCDMΙΧ]+|[Ⅰ-Ⅿⅰ-ⅿ]+)"
-
-# Line that STARTS with "ΠΑΡΑΡΤΗΜΑ" and optional Roman, then word boundary
-ANNEX_HEADING_RE = re.compile(rf"^\s*ΠΑΡΑΡΤΗΜΑ(?:\s+{_ROMAN_CLASS})?\b", re.UNICODE)
-
-
-def _is_annex_heading_line(txt: str) -> bool:
-    """
-    True for a *real* ANNEX heading line:
-      - line begins with 'ΠΑΡΑΡΤΗΜΑ' (+ optional Roman),
-      - NOT the inline continuation case 'ΠΑΡΑΡΤΗΜΑ I του/της/των ...'.
-    We NO LONGER reject headings just because lowercase appears later on the line.
-    """
-    if not txt:
-        return False
-    m = ANNEX_HEADING_RE.match(txt)
-    if not m:
-        return False
-    after = (txt[m.end() :] or "").lstrip()
-    # Inline continuation like: 'ΠΑΡΑΡΤΗΜΑ I του παρόντος ...'
-    return not re.match(r"^(του|της|των)\b", after, flags=re.IGNORECASE | re.UNICODE)
+# Headline (title-like) guard for unfinished-sentence demotion (allow Greek punctuation/marks)
+HEAD_TITLE_RE = re.compile(r"^[A-ZΑ-ΩΊΌΎΈΉΏΪΫ \-–’'\"·\u0374\u0384\u02BC]+$")
 
 
 def _looks_titleish(s: str) -> bool:
-    """Heuristic: short, no digits, no trailing punctuation; e.g., 'Έναρξη ισχύος'."""
-    ts = s.strip()
+    ts = (s or "").strip()
     if len(ts) < 2 or len(ts) > 60:
         return False
     if any(ch.isdigit() for ch in ts):
@@ -401,38 +409,85 @@ def _is_signatureish(line_text: str) -> bool:
         return True
     if DATE_LINE_RE.match(ts):
         return True
-    if SEAL_LINE_RE.match(ts):
+    return bool(SEAL_LINE_RE.match(ts))
+
+
+# ANNEX detection
+_ROMAN_CLASS = r"(?:[IVXLCDMΙΧ]+|[Ⅰ-Ⅿⅰ-ⅿ]+)"
+ANNEX_HEADING_RE = re.compile(rf"^\s*ΠΑΡΑΡΤΗΜΑ(?:\s+{_ROMAN_CLASS})?\b", re.UNICODE)
+
+
+def _is_annex_heading_line(txt: str) -> bool:
+    if not txt:
+        return False
+    m = ANNEX_HEADING_RE.match(txt)
+    if not m:
+        return False
+    after = (txt[m.end() :] or "").lstrip()
+    return not re.match(r"^(του|της|των)\b", after, flags=re.IGNORECASE | re.UNICODE)
+
+
+# --- TOC detection helpers --------------------------------------------------
+SECTION_HEADING_RE = re.compile(r"^\s*(ΜΕΡΟΣ|ΚΕΦΑΛΑΙΟ)\b", re.UNICODE)
+
+
+def _page_looks_like_toc(lines: list[Line], split_x: float | None, page_w: float) -> bool:
+    """
+    Heuristic: Πολλές κεφαλίδες 'Άρθρο N' σε full-width + μερικά 'ΜΕΡΟΣ/ΚΕΦΑΛΑΙΟ'
+    υποδηλώνουν TOC. Δεν αλλάζουμε ταξινόμηση, απλά απενεργοποιούμε τις demotions.
+    """
+    if split_x is None:
+        return False
+
+    heads = 0
+    wide_heads = 0
+    sections = 0
+    PAD = 2.0
+    for x0, _y0, x1, _y1, t in lines:
+        s = t or ""
+        if ARTICLE_HEAD_RE.match(s):
+            heads += 1
+            crosses = (x0 + PAD) < split_x and (x1 - PAD) > split_x
+            is_wide = (x1 - x0) >= 0.80 * page_w or crosses
+            if is_wide:
+                wide_heads += 1
+        elif SECTION_HEADING_RE.match(s) and s.isupper():
+            sections += 1
+
+    if heads >= 6 and wide_heads >= 5:
         return True
-    return bool(UPPER_GREEK_NAME_RE.match(ts))
+    return bool(heads >= 4 and sections >= 2)
+
+
+def _overlap_len(a0: float, a1: float, b0: float, b1: float) -> float:
+    return max(0.0, min(a1, b1) - max(a0, b0))
 
 
 class ColumnExtractor:
     """
     Stateful extractor using sticky split across pages.
-    Detects a *tail* single-column zone after the 2-column body and routes
-    content (e.g., 'Άρθρο 93' and its subtitle) there so it appears after both columns.
-    Also trims junk/signature/backmatter after the last article block.
+    Only three buckets: left, right, tail (single-column after both columns end).
     """
 
-    def __init__(self, debug: bool = False) -> None:
+    def __init__(self, debug: bool = False, debug_pages: set[int] | None = None) -> None:
         self.prev_split_x: float | None = None
         self.prev_w: float | None = None
         self.smoother = SplitSmoother()
         self.debug = debug
-        # new: mark when we've hit the end-of-document anchor on this page
+        self.debug_pages = set(debug_pages or set())
         self.terminal_reached: bool = False
-        # NEW: track if we have seen any article on earlier pages
         self.seen_any_article: bool = False
+        self._seen_article_numbers: set[int] = set()
 
-    def _log(self, *args: object) -> None:
-        if self.debug:
-            print("[pdf]", *args)
+    def _dprint(self, ctx: PageContext, *args: object) -> None:
+        if self.debug and (not self.debug_pages or ctx.page_index in self.debug_pages):
+            print(*args)
 
     def process_page(self, ctx: PageContext, lines: list[Line]) -> str:
         """
-        2-column detection with tail handling, header/footer stripping,
-        article cluster promotion, and smart tail trimming.
-        Also sets self.terminal_reached=True if this page contains an EOD anchor.
+        Two-column detection with tail handling, header/footer stripping,
+        safe demotions, and tail trimming. Sets terminal_reached=True only when
+        a true terminal anchor was trimmed on this page (not for demotions).
         """
         self.terminal_reached = False  # reset for this page
 
@@ -441,64 +496,22 @@ class ColumnExtractor:
         # 0) strip header/footer first
         lines = _filter_headers_footers(lines, w, h)
 
-        # Track if this page has an article head; remember globally
+        # Track if this page has an article head; remember globally (for TOC guard)
         page_has_article = any(ARTICLE_HEAD_RE.match(ln[4] or "") for ln in lines)
         if page_has_article:
             self.seen_any_article = True
 
-        # 1) constants
+        # 1) collect narrow lines for split detection
         WIDE_FRAC = 0.70
-        MARGIN_BELOW = 20.0  # cushion near 2-col bottom
-
-        # helper: bottom of true 2-col zone (TOP of the main band)
-        def _estimate_column_bottom(
-            narrow: list[Line], split_x: float, w: float, h: float
-        ) -> float:
-            if not narrow:
-                return float("inf")
-            bins = max(48, int(h // 15))
-            left_cnt = [0] * bins
-            right_cnt = [0] * bins
-            for x0, y0, x1, y1, _t in narrow:
-                y_mid = (y0 + y1) / 2.0
-                b = min(bins - 1, max(0, int(bins * (y_mid / h))))
-                mid = (x0 + x1) / 2.0
-                (left_cnt if mid < split_x else right_cnt)[b] += 1
-            both = [1 if (left_cnt[i] > 0 and right_cnt[i] > 0) else 0 for i in range(bins)]
-            for i in range(1, bins - 1):
-                if both[i] == 0 and both[i - 1] and both[i + 1]:
-                    both[i] = 1
-            runs = []
-            i = 0
-            while i < bins:
-                if both[i] == 1:
-                    j = i
-                    weight = 0
-                    while j < bins and both[j] == 1:
-                        weight += left_cnt[j] + right_cnt[j]
-                        j += 1
-                    runs.append((i, j - 1, j - i, weight))
-                    i = j
-                else:
-                    i += 1
-            if not runs:
-                return float("inf")
-            runs.sort(key=lambda r: (r[2], r[3]))
-            low, _high, length, _weight = runs[-1]
-            if length < max(4, int(0.08 * bins)):
-                return float("inf")
-            return (low / bins) * h
-
-        # 2) narrow lines for split detection
+        PAD = 2.0
         narrow_for_split: list[Line] = []
         for x0, y0, x1, y1, t in lines:
             if (x1 - x0) < WIDE_FRAC * w:
                 narrow_for_split.append((x0, y0, x1, y1, t))
 
-        y_cut_for_split = 0.0
-        split_x = _choose_split_x(narrow_for_split, w, h, y_cut_for_split)
+        split_x = _choose_split_x(narrow_for_split, w, h, 0.0)
 
-        # 3) sticky reuse + smoothing
+        # sticky reuse + smoothing
         if (
             split_x is None
             and self.prev_split_x is not None
@@ -510,35 +523,35 @@ class ColumnExtractor:
             split_x = self.smoother.suggest(w, h, rot, split_x)
             self.smoother.push(w, h, rot, split_x)
 
-        # 4) no reliable split → single-column
+        # TOC-like page? (disable demotions on this page only)
+        is_toc_page = _page_looks_like_toc(lines, split_x, w)
+        if is_toc_page:
+            self._dprint(
+                ctx,
+                f"[pdf][toc] Page {ctx.page_index+1}: " "TOC-like page — demotions disabled",
+            )
+
+        # If no reliable split → just 1-column; still apply ANNEX/trim logic
         if split_x is None:
             ordered = sorted(lines, key=lambda L: (-L[3], L[0]))
-            if self.debug:
-                self._log(f"Page {ctx.page_index}: 1-column (no reliable split)")
 
-            # Compute last article head y (lowest on page)
+            # Last article y on this page
             last_head_y_1col: float | None = None
             for ln in ordered:
                 if ARTICLE_HEAD_RE.match(ln[4] or ""):
                     y_mid = (ln[1] + ln[3]) / 2.0
-                    last_head_y_1col = (
-                        y_mid
-                        if (last_head_y_1col is None or y_mid < last_head_y_1col)
-                        else last_head_y_1col
-                    )
+                    if last_head_y_1col is None or y_mid < last_head_y_1col:
+                        last_head_y_1col = y_mid
 
-            # ANNEX cut (1-col): normal case (ANNEX below last article on same page)
+            # ANNEX cut
             annex_cut_y_1col: float | None = None
             if last_head_y_1col is not None:
                 for ln in ordered:
-                    txt = ln[4] or ""
-                    if _is_annex_heading_line(txt):
+                    if _is_annex_heading_line(ln[4] or ""):
                         ym = (ln[1] + ln[3]) / 2.0
                         if ym < last_head_y_1col:
                             annex_cut_y_1col = ym
                             break
-            # NEW: page after the last article — no article head on this page,
-            # but we saw an article earlier → any ANNEX heading cuts.
             elif self.seen_any_article:
                 for ln in ordered:
                     if _is_annex_heading_line(ln[4] or ""):
@@ -552,317 +565,583 @@ class ColumnExtractor:
                     if ((ln[1] + ln[3]) / 2.0) > annex_cut_y_1col
                     and not _is_annex_heading_line(ln[4] or "")
                 ]
-                if self.debug:
-                    self._log(
-                        f"Page {ctx.page_index}: cut at ANNEX (1-col) y={annex_cut_y_1col:.1f}"
-                    )
                 self.terminal_reached = True
                 return _lines_to_text(kept)
 
-            # EOD detection even in 1-col: proclamation/signature anywhere?
-            if any(
-                PROCLAIM_RE.match(ln[4] or "") or _is_signatureish(ln[4] or "") for ln in ordered
-            ):
-                self.terminal_reached = True
+            # signature/date/proclamation cut (below last head)
+            if last_head_y_1col is not None:
+                sig_cut_y: float | None = None
+                for ln in ordered:
+                    y_mid = (ln[1] + ln[3]) / 2.0
+                    if y_mid >= last_head_y_1col:
+                        continue
+                    txt = ln[4] or ""
+                    if PROCLAIM_RE.match(txt) or _is_signatureish(txt):
+                        sig_cut_y = y_mid
+                        break
+                if sig_cut_y is not None:
+                    kept = [
+                        ln
+                        for ln in ordered
+                        if ((ln[1] + ln[3]) / 2.0) > sig_cut_y
+                        and not PROCLAIM_RE.match(ln[4] or "")
+                        and not _is_annex_heading_line(ln[4] or "")
+                    ]
+                    self.terminal_reached = True
+                    return _lines_to_text(kept)
+
             return _lines_to_text(ordered)
 
-        # 5) tail detection
-        y_bottom_cols = _estimate_column_bottom(narrow_for_split, split_x, w, h)
-        have_tail_zone = y_bottom_cols != float("inf")
+        # With split: estimate bottoms of columns and gather any pre-tail lines
+        L0, L1 = 0.0 + PAD, split_x - PAD
+        R0, R1 = split_x + PAD, w - PAD
 
-        # 6) classify
+        def _frac_overlap(x0: float, x1: float, a0: float, a1: float) -> float:
+            den = max(0.0, a1 - a0)
+            if den <= 0:
+                return 0.0
+            return _overlap_len(x0, x1, a0, a1) / den
+
+        # Provisional per-column bottoms from all lines (non-heads) roughly in each column
+        left_ys: list[float] = []
+        right_ys: list[float] = []
+        for x0, y0, x1, y1, t in lines:
+            ts = t or ""
+            if ARTICLE_HEAD_RE.match(ts):
+                continue
+            fracL = _frac_overlap(x0, x1, L0, L1)
+            fracR = _frac_overlap(x0, x1, R0, R1)
+            y_mid = (y0 + y1) / 2.0
+            if (fracL >= 0.55) and (fracR <= 0.35):
+                left_ys.append(y_mid)
+            elif (fracR >= 0.55) and (fracL <= 0.35):
+                right_ys.append(y_mid)
+
+        bottom_left = min(left_ys) if left_ys else float("inf")
+        bottom_right = min(right_ys) if right_ys else float("inf")
+        TAIL_Y_CUTOFF = min(bottom_left, bottom_right) - 1.0
+
+        # Cushion: push the cutoff DOWN so end-of-page lines aren’t tailed
+        # ~20pt minimum, scaled by page height (2% of h)
+        TAIL_CUTOFF_CUSHION_PT = max(20.0, 0.02 * h)
+
+        # --- First pass: anything strictly below both columns → tail
+        tail: list[Line] = []
+        non_tail: list[Line] = []
+
+        for ln in lines:
+            x0, y0, x1, y1, t = ln
+            y_mid = (y0 + y1) / 2.0
+            if y_mid <= TAIL_Y_CUTOFF - TAIL_CUTOFF_CUSHION_PT:
+                tail.append(ln)
+            else:
+                non_tail.append(ln)
+
+        # Classify remaining into left/right (no wide buckets)
         left: list[Line] = []
         right: list[Line] = []
-        wide_upper: list[Line] = []
-        wide_lower: list[Line] = []
-        tail_single: list[Line] = []
+        for x0, y0, x1, y1, t in non_tail:
+            fracL = _frac_overlap(x0, x1, L0, L1)
+            fracR = _frac_overlap(x0, x1, R0, R1)
+            if (fracL >= 0.60) and (fracR <= 0.25):
+                left.append((x0, y0, x1, y1, t))
+            elif (fracR >= 0.60) and (fracL <= 0.25):
+                right.append((x0, y0, x1, y1, t))
+            else:
+                mid = (x0 + x1) / 2.0
+                (left if mid < split_x else right).append((x0, y0, x1, y1, t))
 
-        if have_tail_zone:
-            for x0, y0, x1, y1, t in lines:
-                width = x1 - x0
-                y_mid = (y0 + y1) / 2.0
-                is_article_head = ARTICLE_HEAD_RE.match(t) is not None
-                below_or_near_boundary = (y_mid < y_bottom_cols - MARGIN_BELOW) or (
-                    is_article_head and abs(y_mid - y_bottom_cols) <= 24.0
-                )
-                if below_or_near_boundary:
-                    if width >= WIDE_FRAC * w:
-                        wide_lower.append((x0, y0, x1, y1, t))
-                    else:
-                        tail_single.append((x0, y0, x1, y1, t))
-                else:
-                    if width >= WIDE_FRAC * w:
-                        wide_upper.append((x0, y0, x1, y1, t))
-                    else:
-                        mid = (x0 + x1) / 2.0
-                        (left if mid < split_x else right).append((x0, y0, x1, y1, t))
-        else:
-            for x0, y0, x1, y1, t in lines:
-                width = x1 - x0
-                if width >= WIDE_FRAC * w:
-                    wide_upper.append((x0, y0, x1, y1, t))
-                else:
-                    mid = (x0 + x1) / 2.0
-                    (left if mid < split_x else right).append((x0, y0, x1, y1, t))
-
-        # 6.5) Article cluster promotion — only when the head is already in the tail,
-        # and there is tail evidence (proclamation/signature/date/seal) below.
-        tail_evidence = any(
-            PROCLAIM_RE.match(ln[4] or "") or _is_signatureish(ln[4] or "")
-            for ln in (tail_single + wide_lower)
-        )
-        tail_heads: list[Line] = [
-            ln for ln in (tail_single + wide_lower) if ARTICLE_HEAD_RE.match(ln[4] or "")
-        ]
-        if have_tail_zone and tail_evidence and tail_heads:
-            y_head = max((ln[1] + ln[3]) / 2.0 for ln in tail_heads)
-            for bucket in (left, right):
-                keep: list[Line] = []
-                for x0, y0, x1, y1, t in bucket:
-                    y_mid = (y0 + y1) / 2.0
-                    if (y_mid < y_head) and (y_head - y_mid <= 64.0) and _looks_titleish(t):
-                        tail_single.append((x0, y0, x1, y1, t))
-                    else:
-                        keep.append((x0, y0, x1, y1, t))
-                bucket[:] = keep
-
-        # 7) fallback if unbalanced
-        body_count = len(left) + len(right)
-        starving = body_count >= 8 and (
-            len(left) < max(3, 0.15 * body_count) or len(right) < max(3, 0.15 * body_count)
-        )
-        if starving:
-            ordered = sorted(lines, key=lambda L: (-L[3], L[0]))
-            if self.debug:
-                self._log(
-                    f"Page {ctx.page_index}: reverting to 1-column "
-                    f"(unbalanced: L={len(left)} R={len(right)})"
-                )
-
-            # Try ANNEX cut in 1-col too (same as above)
-            last_head_y_unbal: float | None = None
-            for ln in ordered:
-                if ARTICLE_HEAD_RE.match(ln[4] or ""):
-                    y_mid = (ln[1] + ln[3]) / 2.0
-                    last_head_y_unbal = (
-                        y_mid
-                        if (last_head_y_unbal is None or y_mid < last_head_y_unbal)
-                        else last_head_y_unbal
-                    )
-
-            annex_cut_y_unbal: float | None = None
-            if last_head_y_unbal is not None:
-                for ln in ordered:
-                    if _is_annex_heading_line(ln[4] or ""):
-                        ym = (ln[1] + ln[3]) / 2.0
-                        if ym < last_head_y_unbal:
-                            annex_cut_y_unbal = ym
-                            break
-            elif self.seen_any_article:
-                for ln in ordered:
-                    if _is_annex_heading_line(ln[4] or ""):
-                        annex_cut_y_unbal = (ln[1] + ln[3]) / 2.0
-                        break
-
-            if annex_cut_y_unbal is not None:
-                kept = [
-                    ln
-                    for ln in ordered
-                    if ((ln[1] + ln[3]) / 2.0) > annex_cut_y_unbal
-                    and not _is_annex_heading_line(ln[4] or "")
-                ]
-                if self.debug:
-                    self._log(
-                        f"Page {ctx.page_index}: cut at ANNEX (1-col, unbalanced) "
-                        f"y={annex_cut_y_unbal:.1f}"
-                    )
-                self.terminal_reached = True
-                return _lines_to_text(kept)
-
-            # EOD detection
-            if any(
-                PROCLAIM_RE.match(ln[4] or "") or _is_signatureish(ln[4] or "") for ln in ordered
-            ):
-                self.terminal_reached = True
-            return _lines_to_text(ordered)
-
-        # 8) sort within groups
         left_sorted = sorted(left, key=lambda L: (-L[3], L[0]))
         right_sorted = sorted(right, key=lambda L: (-L[3], L[0]))
-        wide_upper_sorted = sorted(wide_upper, key=lambda L: (-L[3], L[0]))
-        tail_single_sorted = sorted(tail_single, key=lambda L: (-L[3], L[0]))
-        wide_lower_sorted = sorted(wide_lower, key=lambda L: (-L[3], L[0]))
+        tail_sorted = sorted(tail, key=lambda L: (-L[3], L[0]))
 
-        # -------------------- Smart tail trimming ----------------------------
-        # Build a unified tail view and decide a cut anchor.
-        tail_all = tail_single_sorted + wide_lower_sorted
-        tail_all_sorted = sorted(tail_all, key=lambda L: (-L[3], L[0]))  # y1 desc, x0 asc
+        # ---------------- Demotions into tail ----------------
 
-        # last article head position (visually lowest head on page)
-        last_head_y_tail: float | None = None
-        for ln in tail_all_sorted + left_sorted + right_sorted + wide_upper_sorted:
-            if ARTICLE_HEAD_RE.match(ln[4] or ""):
-                y_mid = (ln[1] + ln[3]) / 2.0
-                last_head_y_tail = (
-                    y_mid
-                    if (last_head_y_tail is None or y_mid < last_head_y_tail)
-                    else last_head_y_tail
-                )
+        def _first_head_idx(lines_sorted: list[Line]) -> int | None:
+            for i, (_x0, _y0, _x1, _y1, raw) in enumerate(lines_sorted):
+                if ARTICLE_HEAD_RE.match(raw or ""):
+                    return i
+            return None
 
-        y_cut: float | None = None
-        cut_reason: str | None = None
+        def _ends_with_terminal(s: str) -> bool:
+            if not s:
+                return False
+            ts = re.sub(r"[»”'\"\)\]\}]+$", "", s.strip())
+            if ts.endswith("-"):
+                return False
+            return bool(re.search(r"[.\u00B7;!…]$", ts))
 
-        # Prefer proclamation
-        for ln in tail_all_sorted:
-            if PROCLAIM_RE.match(ln[4] or ""):
-                y_cut = (ln[1] + ln[3]) / 2.0
-                cut_reason = "proclaim"
-                break
+        def _bucket_demote_from_head_if_width_change(
+            lines_sorted: list[Line], side: str
+        ) -> tuple[list[Line], list[Line], bool]:
+            # Σελίδα TOC; ποτέ demotion εδώ
+            if is_toc_page:
+                return lines_sorted, [], False
 
-        # If no proclamation, standalone ANNEX heading AFTER the last article
-        if y_cut is None and last_head_y_tail is not None:
-            for ln in tail_all_sorted:
-                txt = ln[4] or ""
-                ym = (ln[1] + ln[3]) / 2.0
-                if ym >= last_head_y_tail:  # only below the last article
+            i = _first_head_idx(lines_sorted)
+            if i is None:
+                return lines_sorted, [], False
+
+            # Απαιτούμε «γερό» cross: σημαντική κάλυψη και στα δύο κανάλια
+            CROSS_FRAC_MIN = 0.28  # τουλάχιστον 28% κάλυψη σε κάθε κανάλι
+            CROSS_PAD = max(4.0, 0.01 * w)  # πιο «ακριβές» pad από το απλό PAD
+
+            def crosses_strong(x0: float, x1: float) -> bool:
+                # Πρέπει να διασχίζει ξεκάθαρα το split (με ασφάλεια CROSS_PAD)
+                if not ((x0 + CROSS_PAD) < split_x and (x1 - CROSS_PAD) > split_x):
+                    return False
+                # Και να καλύπτει ουσιαστικό ποσοστό και του αριστερού και του δεξιού καναλιού
+                lcov = _frac_overlap(x0, x1, L0, L1)
+                rcov = _frac_overlap(x0, x1, R0, R1)
+                return (lcov >= CROSS_FRAC_MIN) and (rcov >= CROSS_FRAC_MIN)
+
+            # Ελέγχουμε τις 1–3 επόμενες γραμμές μετά τον πρώτο head της στήλης
+            for j in range(i + 1, min(i + 4, len(lines_sorted))):
+                x0, _y0, x1, _y1, raw = lines_sorted[j]
+                s = (raw or "").strip()
+
+                # Αγνόησε καθαρούς τίτλους/κεφαλίδες (ALL-CAPS, ΜΕΡΟΣ/ΚΕΦΑΛΑΙΟ)
+                if (
+                    (SECTION_HEADING_RE.match(s) and s.isupper()) or HEAD_TITLE_RE.match(s)
+                ) and not _is_annex_heading_line(s):
                     continue
-                if _is_annex_heading_line(txt):
-                    y_cut = ym
-                    cut_reason = "annex"
-                    break
 
-            # Fallback: ANNEX appeared in upper or columns but still after last article
-            if y_cut is None:
-                for ln in sorted(
-                    wide_upper_sorted + left_sorted + right_sorted, key=lambda L: (-L[3], L[0])
-                ):
-                    txt = ln[4] or ""
-                    ym = (ln[1] + ln[3]) / 2.0
-                    if ym >= last_head_y_tail:
-                        continue
-                    if _is_annex_heading_line(txt):
-                        y_cut = ym
-                        cut_reason = "annex"
-                        break
+                if crosses_strong(x0, x1):
+                    head_and_after = lines_sorted[i:]
+                    before = lines_sorted[:i]
+                    # Debug info για να δεις «γιατί» θεωρήθηκε cross
+                    if self.debug and (not self.debug_pages or ctx.page_index in self.debug_pages):
+                        lcov = _frac_overlap(x0, x1, L0, L1)
+                        rcov = _frac_overlap(x0, x1, R0, R1)
+                        self._dprint(
+                            ctx,
+                            (
+                                f"[pdf][width-switch] Page {ctx.page_index+1} {side}: "
+                                f"demoting {len(head_and_after)} line(s) to tail "
+                                f"(triggered by j={j}, x0={x0:.1f}, x1={x1:.1f}, "
+                                f"split={split_x:.1f}, "
+                                f"Lcov={lcov:.2f}, Rcov={rcov:.2f})"
+                            ),
+                        )
+                    return before, head_and_after, True
 
-        # NEW: page has no article head but we’ve seen articles earlier → ANNEX anywhere cuts
-        if y_cut is None and last_head_y_tail is None and self.seen_any_article:
-            for ln in sorted(
-                wide_upper_sorted + left_sorted + right_sorted + tail_all_sorted,
-                key=lambda L: (-L[3], L[0]),
-            ):
-                if _is_annex_heading_line(ln[4] or ""):
-                    y_cut = (ln[1] + ln[3]) / 2.0
-                    cut_reason = "annex"
-                    break
+            return lines_sorted, [], False
 
-        # If still nothing, signature/date/seal after last head
-        if y_cut is None:
-            for ln in tail_all_sorted:
-                y_mid = (ln[1] + ln[3]) / 2.0
-                if last_head_y_tail is not None and y_mid >= last_head_y_tail:
+        def _bucket_demote_if_unfinished_then_head(
+            lines_sorted: list[Line],
+            side: str,
+        ) -> tuple[list[Line], list[Line], bool]:
+            if is_toc_page:
+                return lines_sorted, [], False
+            if not self.seen_any_article:
+                return lines_sorted, [], False
+            i = _first_head_idx(lines_sorted)
+            if i is None or i == 0:
+                return lines_sorted, [], False
+            # Find last meaningful line above
+            last_txt = ""
+            for j in range(i - 1, -1, -1):
+                t = lines_sorted[j][4] or ""
+                if not t:
                     continue
-                if _is_signatureish(ln[4]):
-                    y_cut = y_mid
-                    cut_reason = "signature"
-                    break
-
-        # If still nothing, first ALL-CAPS run (>=2)
-        if y_cut is None and last_head_y_tail is not None:
-            caps_run = []
-            for ln in tail_all_sorted:
-                y_mid = (ln[1] + ln[3]) / 2.0
-                if y_mid >= last_head_y_tail:
+                if ARTICLE_HEAD_RE.match(t) or _is_annex_heading_line(t):
                     continue
-                is_caps = bool(UPPER_GREEK_NAME_RE.match(ln[4] or ""))
-                if is_caps:
-                    caps_run.append(ln)
-                    if len(caps_run) >= 2:
-                        y_cut = (caps_run[0][1] + caps_run[0][3]) / 2.0
-                        cut_reason = "caps"
-                        break
-                else:
-                    caps_run = []
-
-        if self.debug:
-            self._log(
-                f"Page {ctx.page_index}: 2-columns @ x={split_x:.1f} "
-                f"(tail={'yes' if have_tail_zone else 'no'} "
-                f"| wide_upper={len(wide_upper_sorted)} L={len(left_sorted)} "
-                f"R={len(right_sorted)} tail_single={len(tail_single_sorted)} "
-                f"wide_lower={len(wide_lower_sorted)} | y_cut={y_cut} reason={cut_reason})"
+                last_txt = t.strip()
+                if last_txt:
+                    break
+            if not last_txt:
+                return lines_sorted, [], False
+            if _ends_with_terminal(last_txt) or HEAD_TITLE_RE.match(last_txt):
+                return lines_sorted, [], False
+            head_and_after = lines_sorted[i:]
+            before = lines_sorted[:i]
+            self._dprint(
+                ctx,
+                (
+                    f"[pdf][break] Page {ctx.page_index+1} {side}: head after unfinished "
+                    f"sentence → demoting {len(head_and_after)} line(s) to tail"
+                ),
             )
+            return before, head_and_after, True
 
-        # If we cut for any of the terminal reasons, mark EOD so later pages are dropped
-        if cut_reason in {"proclaim", "signature", "caps", "annex"}:
-            self.terminal_reached = True
+        # Article-gap demotion
+        HEAD_NUM_RE = re.compile(r"^\s*Άρθρο\s+(\d+)\b", re.IGNORECASE | re.UNICODE)
 
-        # 9) unified emission is built below (pre-emission removed)
-        if cut_reason in {"proclaim", "signature", "caps", "annex"}:
-            self.terminal_reached = True
-
-        # ---- UNIFIED EMISSION (apply cut to ALL buckets, drop ANNEX heading line) ----
-
-        def _keep_above_and_not_annex(lines_sorted: list[Line], cut: float | None) -> list[Line]:
-            """Keep only lines above the cut.
-            Also drop the ANNEX heading itself and proclamation lines.
-            """
-            out: list[Line] = []
-            for ln in lines_sorted:
-                txt = ln[4] if isinstance(ln[4], str) else ""
-                # drop the ANNEX heading line itself
-                if _is_annex_heading_line(txt):
-                    continue
-                if cut is None:
-                    out.append(ln)
-                    continue
-                y_mid = (ln[1] + ln[3]) / 2.0
-                # Keep items visually ABOVE the cut; also drop proclamation lines
-                if y_mid > cut and not PROCLAIM_RE.match(txt):
-                    out.append(ln)
+        def _heads_in(lines_sorted: list[Line]) -> list[int]:
+            out: list[int] = []
+            for _x0, _y0, _x1, _y1, raw in lines_sorted:
+                m = HEAD_NUM_RE.match(raw or "")
+                if m:
+                    with contextlib.suppress(Exception):
+                        out.append(int(m.group(1)))
             return out
 
-        # Apply to all buckets
-        wide_upper_emit = _keep_above_and_not_annex(wide_upper_sorted, y_cut)
-        left_emit = _keep_above_and_not_annex(left_sorted, y_cut)
-        right_emit = _keep_above_and_not_annex(right_sorted, y_cut)
-        tail_single_emit = _keep_above_and_not_annex(tail_single_sorted, y_cut)
-        wide_lower_emit = _keep_above_and_not_annex(wide_lower_sorted, y_cut)
+        page_heads = set(_heads_in(left_sorted) + _heads_in(right_sorted) + _heads_in(tail_sorted))
 
-        out_parts: list[str] = []
+        def _bucket_demote_on_true_gap(
+            lines_sorted: list[Line],
+            side: str,
+        ) -> tuple[list[Line], list[Line], bool]:
+            if is_toc_page:
+                return lines_sorted, [], False
+            prev = None
+            cut = None
+            trigger = None
+            for i, (_x0, _y0, _x1, _y1, raw) in enumerate(lines_sorted):
+                m = HEAD_NUM_RE.match(raw or "")
+                if not m:
+                    continue
+                try:
+                    n = int(m.group(1))
+                except Exception:
+                    continue
+                if prev is None:
+                    prev = n
+                    continue
+                if n >= prev + 2:
+                    missing = set(range(prev + 1, n))
+                    if missing.isdisjoint(page_heads) and missing.isdisjoint(
+                        self._seen_article_numbers
+                    ):
+                        cut = i
+                        trigger = n
+                        break
+                prev = max(prev, n)
+            if cut is None:
+                return lines_sorted, [], False
+            head_and_after = lines_sorted[cut:]
+            before = lines_sorted[:cut]
+            self._dprint(
+                ctx,
+                (
+                    f"[pdf][gap] Page {ctx.page_index+1} {side}: TRUE GAP prev→curr "
+                    f"triggers demotion of {len(head_and_after)} line(s) to tail "
+                    f"(trigger={trigger})"
+                ),
+            )
+            return before, head_and_after, True
 
-        def _safe_text(lines: list[Line]) -> str:
-            s = _lines_to_text(lines)
-            # Guard: _lines_to_text always returns a string, but be defensive
-            return s if isinstance(s, str) else ""
+        # Apply demotions in priority order: width-switch → unfinished → gap
+        left_sorted, extra_tail, moved = _bucket_demote_from_head_if_width_change(
+            left_sorted, "LEFT"
+        )
+        if moved and extra_tail:
+            tail_sorted = extra_tail + tail_sorted
+        if not moved:
+            left_sorted, extra_tail, moved = _bucket_demote_if_unfinished_then_head(
+                left_sorted, "LEFT"
+            )
+            if moved and extra_tail:
+                tail_sorted = extra_tail + tail_sorted
+        left_sorted, extra_tail, moved2 = _bucket_demote_on_true_gap(left_sorted, "LEFT")
+        if moved2 and extra_tail:
+            tail_sorted = extra_tail + tail_sorted
 
-        if wide_upper_emit:
-            out_parts.append(_safe_text(wide_upper_emit))
-        if left_emit:
-            if out_parts:
-                out_parts.append("")
-            out_parts.append(_safe_text(left_emit))
-        if right_emit:
-            if out_parts:
-                out_parts.append("")
-            out_parts.append(_safe_text(right_emit))
-        if tail_single_emit:
-            if out_parts:
-                out_parts.append("")
-            out_parts.append(_safe_text(tail_single_emit))
-        if wide_lower_emit:
-            if out_parts:
-                out_parts.append("")
-            out_parts.append(_safe_text(wide_lower_emit))
+        # Update seen article numbers after processing this page
+        self._seen_article_numbers.update(page_heads)
 
-        # EXTRA guard against accidental None in parts
-        out_parts = [p if isinstance(p, str) else "" for p in out_parts]
-        page_text = "\n".join(out_parts).rstrip()
+        # --------- ANNEX terminal: stop emitting from the first ANNEX heading and after ----------
+        def _first_annex_y_pre() -> float | None:
+            # Search BEFORE dropping annex headings
+            all_lines_pre = sorted(
+                left_sorted + right_sorted + tail_sorted, key=lambda L: (-L[3], L[0])
+            )
+            for _x0, y0, _x1, y1, raw in all_lines_pre:
+                if _is_annex_heading_line(raw or ""):
+                    return (y0 + y1) / 2.0
+            return None
+
+        annex_cut_y = _first_annex_y_pre()
+        if annex_cut_y is not None:
+
+            def _split_annex(lines_sorted: list[Line]) -> list[Line]:
+                above: list[Line] = []
+                for ln in lines_sorted:
+                    ym = (ln[1] + ln[3]) / 2.0
+                    if ym > annex_cut_y:  # keep only content ABOVE the ANNEX heading
+                        above.append(ln)
+                return above
+
+            left_sorted = _split_annex(left_sorted)
+            right_sorted = _split_annex(right_sorted)
+            tail_sorted = _split_annex(tail_sorted)
+            # Stop after this page; remaining pages are Annex
+            self.terminal_reached = True
+
+        # Drop ANNEX headings from emission
+        def _drop_annex(lines_sorted: list[Line]) -> list[Line]:
+            out: list[Line] = []
+            for x0, y0, x1, y1, raw in lines_sorted:
+                txt = raw or ""
+                if _is_annex_heading_line(txt):
+                    continue
+                out.append((x0, y0, x1, y1, txt))
+            return out
+
+        left_sorted = _drop_annex(left_sorted)
+        right_sorted = _drop_annex(right_sorted)
+        tail_sorted = _drop_annex(tail_sorted)
+
+        # ---------------- Global full-width switch to single-column tail ----
+        # If a truly full-width line appears (spans both columns with sizable overlap
+        # OR is >= 92% page width), then EVERYTHING at or below that y goes to the tail.
+        # Ignored on TOC-like pages and for header-ish lines (Άρθρο/ΜΕΡΟΣ/ΚΕΦΑΛΑΙΟ/title-ish).
+        if split_x is not None and not is_toc_page:
+            COL_CROSS_MIN_FRAC = 0.28  # at least ~28% της κάθε στήλης σε κάθε πλευρά
+
+            def _is_headerish(s: str) -> bool:
+                if not s:
+                    return False
+                if ARTICLE_HEAD_RE.match(s):
+                    return True
+                if SECTION_HEADING_RE.match(s) and s.isupper():
+                    return True
+                return bool(HEAD_TITLE_RE.match(s.strip()))
+
+            def _first_fullwidth_y_all() -> tuple[float, str] | tuple[None, None]:
+                # γεωμετρία στηλών
+                col_w = max(1.0, min(L1 - L0, R1 - R0))
+                all_non_tail = sorted(left_sorted + right_sorted, key=lambda L: (-L[3], L[0]))
+                for x0, y0, x1, y1, t in all_non_tail:
+                    s = t or ""
+                    if _is_headerish(s):
+                        continue
+
+                    # overlap με κάθε στήλη
+                    overL = _overlap_len(x0, x1, L0, L1)
+                    overR = _overlap_len(x0, x1, R0, R1)
+                    crosses_strong = (overL >= COL_CROSS_MIN_FRAC * col_w) and (
+                        overR >= COL_CROSS_MIN_FRAC * col_w
+                    )
+
+                    # εναλλακτικό: πραγματικά τεράστιο πλάτος
+                    is_very_wide = (x1 - x0) >= 0.92 * w
+
+                    if crosses_strong or is_very_wide:
+                        return ((y0 + y1) / 2.0, s)
+                return (None, None)
+
+            cut_y, trigger_txt = _first_fullwidth_y_all()
+            if cut_y is not None:
+                # Split buckets at the trigger y
+                def _split_by_y(lines_sorted: list[Line]) -> tuple[list[Line], list[Line]]:
+                    above: list[Line] = []
+                    below: list[Line] = []
+                    for x0, y0, x1, y1, txt in lines_sorted:
+                        ym = (y0 + y1) / 2.0
+                        (below if ym <= cut_y else above).append((x0, y0, x1, y1, txt))
+                    return above, below
+
+                left_above, left_below = _split_by_y(left_sorted)
+                right_above, right_below = _split_by_y(right_sorted)
+
+                # (a) Has an article head already appeared above this cut on this page?
+                def _has_head_above(lines_sorted: list[Line]) -> bool:
+                    for _x0, y0, _x1, y1, t in lines_sorted:
+                        if ARTICLE_HEAD_RE.match(t or "") and (y0 + y1) / 2.0 > cut_y:
+                            return True
+                    return False
+
+                has_head_above = _has_head_above(left_above) or _has_head_above(right_above)
+
+                # (b) Is the trigger likely a masthead/issue banner?
+                def _is_mastheadish(s: str) -> bool:
+                    if not s:
+                        return False
+                    s2 = (s or "").strip()
+                    # very uppercase Greek-ish text?
+                    letters = [ch for ch in s2 if ch.isalpha()]
+                    if letters:
+                        up_ratio = sum(ch == ch.upper() for ch in letters) / len(letters)
+                    else:
+                        up_ratio = 0.0
+                    # typical Gazette tokens
+                    has_gov = "ΕΛΛΗΝΙΚ" in s2 and "ΔΗΜΟΚΡΑΤ" in s2
+                    has_issue = "Αρ." in s2 and "Φύλλ" in s2
+                    has_series = "ΤΕΥΧΟΣ" in s2
+                    return (up_ratio >= 0.90) and (has_gov or has_issue or has_series)
+
+                # (c) Require non-trivial two-column content already ABOVE the cut
+                min_above = 6  # tune 4–8 if needed
+                above_count = len(left_above) + len(right_above)
+
+                # Final condition: demote only if (enough above OR an article head above),
+                # and the trigger is not mastheadish
+                should_demote = (
+                    (above_count >= min_above) or has_head_above
+                ) and not _is_mastheadish(trigger_txt or "")
+
+                moved_lines: list[Line] = left_below + right_below
+                if should_demote and moved_lines:
+                    self._dprint(
+                        ctx,
+                        (
+                            f"[pdf][global-width→tail] Page {ctx.page_index+1}: "
+                            f"full-width detected (trigger='{(trigger_txt or '')[:60]}…') "
+                            f"→ moving {len(moved_lines)} line(s) to tail"
+                        ),
+                    )
+                    left_sorted = left_above
+                    right_sorted = right_above
+                    tail_sorted = sorted(
+                        tail_sorted + moved_lines,
+                        key=lambda L: (-L[3], L[0]),
+                    )
+
+        # ---------------- Late pickup / demotions for terminal & full-width ----
+        # If a proclamation/signature/date line OR a late full-width line appears
+        # inside LEFT/RIGHT (even if no head remains there), move from that line
+        # downwards to the tail.
+
+        def _last_head_y_bucket(lines_sorted: list[Line]) -> float | None:
+            y: float | None = None
+            for _x0, y0, _x1, y1, raw in lines_sorted:
+                if ARTICLE_HEAD_RE.match(raw or ""):
+                    ym = (y0 + y1) / 2.0
+                    y = ym if (y is None or ym > y) else y
+            return y
+
+        def _pickup_terminal_to_tail(
+            lines_sorted: list[Line], side: str
+        ) -> tuple[list[Line], list[Line], bool]:
+            if not lines_sorted:
+                return lines_sorted, [], False
+            last_head_y = _last_head_y_bucket(lines_sorted)
+
+            for i, (x0, y0, x1, y1, raw) in enumerate(lines_sorted):
+                txt = raw or ""
+                ym = (y0 + y1) / 2.0
+
+                # If there *is* a last head, only consider lines below it.
+                # If there is NO head in this bucket, we still consider all lines,
+                # because terminal blocks may have been separated earlier.
+                if last_head_y is not None and ym >= last_head_y:
+                    continue
+
+                # strong anchors
+                if PROCLAIM_RE.match(txt) or _is_signatureish(txt):
+                    before = lines_sorted[:i]
+                    moved = lines_sorted[i:]
+                    self._dprint(
+                        ctx,
+                        (
+                            f"[pdf][terminal→tail] Page {ctx.page_index+1} {side}: "
+                            f"moving {len(moved)} line(s) to tail"
+                        ),
+                    )
+                    return before, moved, True
+
+                # inline variants: keep prefix and move rest
+                m_inline = (
+                    SIGNATURE_INLINE_RE.search(txt)
+                    or DATE_INLINE_RE.search(txt)
+                    or SEAL_INLINE_RE.search(txt)
+                )
+                if m_inline:
+                    before = lines_sorted[:i]
+                    prefix = txt[: m_inline.start()].rstrip(" ,.;·:")
+                    keep_line = (x0, y0, x1, y1, prefix) if prefix else None
+                    moved_first = (x0, y0, x1, y1, txt[m_inline.start() :].lstrip())
+                    moved = [moved_first] + lines_sorted[i + 1 :]
+                    if keep_line:
+                        before.append(keep_line)
+                    self._dprint(
+                        ctx,
+                        (
+                            f"[pdf][terminal-inline→tail] Page {ctx.page_index+1} "
+                            f"{side}: moving {len(moved)} line(s) to tail "
+                            f"(kept prefix)"
+                        ),
+                    )
+                    return before, moved, True
+
+            return lines_sorted, [], False
+
+        # First try direct terminal pickup (works even with no head in bucket)
+        left_sorted, moved_tail, did_pick = _pickup_terminal_to_tail(left_sorted, "LEFT")
+        if did_pick and moved_tail:
+            tail_sorted += moved_tail
+        right_sorted, moved_tail, did_pick = _pickup_terminal_to_tail(right_sorted, "RIGHT")
+        if did_pick and moved_tail:
+            tail_sorted += moved_tail
+
+        # ---------------- Tail trimming (terminal anchors) ------------------
+        def _trim_tail(lines_sorted: list[Line]) -> tuple[list[Line], bool]:
+            if not lines_sorted:
+                return lines_sorted, False
+            last_head_y = _last_head_y_bucket(lines_sorted)
+            out: list[Line] = []
+            trimmed = False
+            for x0, y0, x1, y1, raw in lines_sorted:
+                txt = raw or ""
+                ym = (y0 + y1) / 2.0
+                below_ok = (last_head_y is not None and ym < last_head_y) or (last_head_y is None)
+                if below_ok:
+                    if (
+                        PROCLAIM_RE.match(txt)
+                        or SIGNATURE_HEADER_RE.match(txt)
+                        or DATE_LINE_RE.match(txt)
+                        or SEAL_LINE_RE.match(txt)
+                    ):
+                        trimmed = True
+                        break
+                    m_inline = (
+                        SIGNATURE_INLINE_RE.search(txt)
+                        or DATE_INLINE_RE.search(txt)
+                        or SEAL_INLINE_RE.search(txt)
+                    )
+                    if m_inline:
+                        prefix = txt[: m_inline.start()].rstrip(" ,.;·:")
+                        if prefix:
+                            out.append((x0, y0, x1, y1, prefix))
+                        trimmed = True
+                        break
+                out.append((x0, y0, x1, y1, txt))
+            return out, trimmed
+
+        tail_sorted, did_trim_tail = _trim_tail(tail_sorted)
+        if did_trim_tail:
+            self.terminal_reached = True
+
+        # ---------------- Emit (keep natural reading order) -----------------
+        def _safe_text(lines_sorted: list[Line]) -> str:
+            return _lines_to_text(lines_sorted)
+
+        # Debug dump (only selected pages)
+        if self.debug and (not self.debug_pages or ctx.page_index in self.debug_pages):
+            print(
+                f"[pdf][debug] Page {ctx.page_index+1}/{ctx.page_count or '?'} "
+                "— emission after trims:"
+            )
+
+            def _dump_bucket(label: str, lines_sorted: list[Line]) -> None:
+                print(f"  -- {label} ({len(lines_sorted)} lines) --")
+                for i, (_x0, _y0, _x1, _y1, raw) in enumerate(lines_sorted):
+                    t = raw or ""
+                    print(f"    [{i:03d}] {t}")
+
+            _dump_bucket("left", left_sorted)
+            _dump_bucket("right", right_sorted)
+            _dump_bucket("tail", tail_sorted)
+            print(f"  terminal_reached on this page? {self.terminal_reached}")
+
+        parts: list[str] = []
+        if left_sorted:
+            parts.append(_safe_text(left_sorted))
+        if right_sorted:
+            if parts:
+                parts.append("")
+            parts.append(_safe_text(right_sorted))
+        if tail_sorted:
+            if parts:
+                parts.append("")
+            parts.append(_safe_text(tail_sorted))
 
         # remember split for next page
         self.prev_split_x = split_x
         self.prev_w = w
-        return page_text
+
+        return "\n".join(parts).rstrip()
 
 
 # --------------------------- Text joiner ----------------------------------- #
@@ -872,17 +1151,9 @@ def _lines_to_text(lines: list[Line]) -> str:
     """
     Group nearby lines into paragraphs, join with newlines,
     and de-hyphenate simple word breaks (prev endswith '-' + next starts with Greek lowercase).
-    Always returns a string; sanitizes any non-str text payloads.
     """
     if not lines:
         return ""
-
-    def _s(txt: object) -> str:
-        if isinstance(txt, str):
-            return txt
-        if txt is None:
-            return ""
-        return str(txt)
 
     paras: list[list[str]] = []
     curr: list[str] = []
@@ -894,14 +1165,13 @@ def _lines_to_text(lines: list[Line]) -> str:
             paras.append(curr.copy())
             curr.clear()
 
-    for _x0, y0, _x1, y1, t in lines:
-        s = _s(t)
+    for _x0, y0, _x1, y1, t in sorted(lines, key=lambda L: (-L[3], L[0])):
+        s = t or ""
         if last_y0 is None:
             curr.append(s)
             last_y0, last_y1 = y0, y1
             continue
 
-        # mypy guard: last_y0/last_y1 are Optional by type; at this point they are set.
         assert last_y0 is not None and last_y1 is not None
         ly0 = float(last_y0)
         ly1 = float(last_y1)
@@ -919,7 +1189,6 @@ def _lines_to_text(lines: list[Line]) -> str:
         last_y0, last_y1 = y0, y1
 
     flush()
-    # Everything in paras is str now
     return "\n".join("\n".join(p) for p in paras if p)
 
 
@@ -935,14 +1204,8 @@ def _debug_print_last_article(full_text: str) -> None:
             return
 
         last = matches[-1]
-        last_num = last.group(1)
         start = last.start()
         block = full_text[start:].strip()
-
-        print(f"[pdf] LAST ARTICLE = {last_num}")
-        print("[pdf] --- LAST ARTICLE BLOCK ---")
-        print(block)
-        print("[pdf] --- END BLOCK ---\n")
 
         # Helpful: check if an ANNEX heading still survives in this tail
         try:
@@ -951,9 +1214,6 @@ def _debug_print_last_article(full_text: str) -> None:
             has_annex = "ΠΑΡΑΡΤΗΜΑ" in block
         print("[pdf] Contains ANNEX heading?", has_annex)
 
-        # Also dump to file in case stdout is swallowed by the runner
-        with open("last_article_debug.txt", "w", encoding="utf-8") as f:
-            f.write(block)
     except Exception as e:
         print("[pdf] Debug print of last article failed:", e)
 
@@ -961,12 +1221,31 @@ def _debug_print_last_article(full_text: str) -> None:
 # --------------------------- Public API ----------------------------------- #
 
 
-def extract_text_whole(path: _PathLike, debug: bool = False) -> str:
+def extract_text_whole(
+    path: _PathLike, debug: bool = False, debug_pages: int | set[int] | None = None
+) -> str:
     """
     Iterate pages with ColumnExtractor, stop if a terminal anchor is hit,
     then (when debug=True) print/dump the last-article block for inspection.
+
+    `debug_pages`:
+      - int -> treated as **1-based** page number (human-friendly).
+      - set[int] -> treated as **0-based** indices.
     """
-    extractor = ColumnExtractor(debug=debug)
+    if isinstance(debug_pages, int):
+        debug_pages_set = {max(0, debug_pages - 1)}
+    elif isinstance(debug_pages, set):
+        debug_pages_set = set(debug_pages)
+    elif debug_pages is None:
+        debug_pages_set = set()
+    else:
+        try:
+            debug_pages_set = set(debug_pages)
+        except Exception:
+            debug_pages_set = set()
+
+    extractor = ColumnExtractor(debug=debug, debug_pages=debug_pages_set)
+    total_pages = count_pages(path) or 0
     out_pages: list[str] = []
 
     for page_index, layout in enumerate(extract_pages(_to_str_path(path))):
@@ -975,36 +1254,38 @@ def extract_text_whole(path: _PathLike, debug: bool = False) -> str:
 
         w, h = layout.width, layout.height
         rot = getattr(layout, "rotate", 0) or 0
-        if rot % 180 != 0 and debug:
-            print(f"[pdf] Page {page_index}: rotation={rot}° (split may be skipped)")
+        if rot % 180 != 0 and debug and (not debug_pages_set or page_index in debug_pages_set):
+            print(f"[pdf] Page {page_index+1}: rotation={rot}° (split may be skipped)")
 
         lines = list(_iter_lines(layout))
         if not lines:
             out_pages.append("")
             continue
 
-        ctx = PageContext(page_index=page_index, width=w, height=h, rotation=rot)
+        ctx = PageContext(
+            page_index=page_index, width=w, height=h, rotation=rot, page_count=total_pages
+        )
         page_text = extractor.process_page(ctx, lines)
         out_pages.append(page_text)
 
         # Stop and drop remaining pages if terminal anchor detected on this page
         if extractor.terminal_reached:
-            if debug:
-                print(f"[pdf] Stop after page {page_index}: terminal anchor detected.")
+            if debug and (not debug_pages_set or page_index in debug_pages_set):
+                print(f"[pdf] Stop after page {page_index+1}: terminal anchor detected.")
             break
 
-    # Build the final text AFTER the loop so we can debug-print it
     full_text = "\n\n".join(out_pages).rstrip()
 
-    # Debug: show the last article block and also write it to a file
     if debug:
         _debug_print_last_article(full_text)
 
     return full_text
 
 
-def extract_pdf_text(path: _PathLike, debug: bool = False) -> str:
-    return extract_text_whole(path, debug=debug)
+def extract_pdf_text(
+    path: _PathLike, debug: bool = False, debug_pages: int | set[int] | None = None
+) -> str:
+    return extract_text_whole(path, debug=debug, debug_pages=debug_pages)
 
 
 # ----------------------- Your originals (kept) ----------------------------- #

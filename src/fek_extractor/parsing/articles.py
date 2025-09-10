@@ -162,7 +162,7 @@ def _is_bullet(s: str) -> bool:
 DEBUG_ENABLE: bool = False  # flip to False to silence all debug
 # allow either a concrete article number (int) or the wildcard "*"
 DEBUGKey = int | Literal["*"]
-DEBUG_ARTICLES: set[DEBUGKey] = {38}  # which article numbers to trace
+DEBUG_ARTICLES: set[DEBUGKey] = {89}  # which article numbers to trace
 _DBG_CUR_ARTNO: int | None = None  # set around extraction of each article
 
 
@@ -676,6 +676,7 @@ def extract_articles(tokens: Iterable[str]) -> dict[str, dict[str, Any]]:
 
 def build_articles_map(text: str, ctx: Ctx | None = None) -> dict[str, Any]:
     lines = _splitlines_preserve(text)
+
     base_ctx = _ctx_to_dict(ctx) if ctx is not None else {}
     heads, map_ctx = _collect_contexted_heads(lines, base_ctx=base_ctx)
     heads = _dedupe_and_skip_toc(heads, lines)

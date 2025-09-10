@@ -28,8 +28,17 @@ def extract_pdf_info(
     """
     debug: bool = bool(kwargs.get("debug", False))
 
+    # NEW: accept an optional page from kwargs (from CLI)
+    raw_dp = kwargs.get("debug_pages")
+    if isinstance(raw_dp, str):
+        try:
+            raw_dp = int(raw_dp)
+        except ValueError:
+            raw_dp = None
+    debug_pages: int | None = raw_dp if isinstance(raw_dp, int) and raw_dp > 0 else None
+
     # 1) Extract full text (headers/footers filtered)
-    full_text: str = extract_pdf_text(pdf_path, debug=debug)
+    full_text: str = extract_pdf_text(pdf_path, debug=debug, debug_pages=debug_pages)
 
     # Precompute normalized text once (used by decision + metrics)
     text_norm: str = normalize_text(full_text)

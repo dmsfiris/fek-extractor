@@ -26,6 +26,7 @@ def _process_pdf(
     pdf: Path,
     include_metrics: bool,
     debug: bool,
+    debug_pages: int | None,
 ) -> dict[str, Any]:
     """
     Worker that returns a plain dict for JSON/CSV.
@@ -36,6 +37,7 @@ def _process_pdf(
             pdf,
             include_metrics=include_metrics,
             debug=debug,
+            debug_pages=debug_pages,
         )
         return dict(rec)
     except Exception as e:
@@ -72,6 +74,94 @@ def _articles_only_payload(records: list[dict[str, Any]]) -> Any:
     return out
 
 
+def _build_toc_from_articles(articles: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Hierarchy:
+      Part -> Title -> Chapter -> Section -> Articles
+    If a Chapter has no Sections, its articles are attached directly under the Chapter.
+    Missing letters/titles are rendered as empty strings.
+    """
+    from collections import OrderedDict
+
+    parts_map: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+    for k, rec in articles.items():
+        try:
+            num = int(k)
+        except Exception:
+            continue
+
+        title_display = (rec.get("title") or "").strip()
+        part_letter = (rec.get("part_letter") or "") or ""
+        part_title = (rec.get("part_title") or "") or ""
+        title_letter = (rec.get("title_letter") or "") or ""
+        title_title = (rec.get("title_title") or "") or ""
+        chapter_letter = (rec.get("chapter_letter") or "") or ""
+        chapter_title = (rec.get("chapter_title") or "") or ""
+        section_letter = (rec.get("section_letter") or "") or ""
+        section_title = (rec.get("section_title") or "") or ""
+
+        # PART
+        part_key = (part_letter, part_title)
+        part_node = parts_map.get(part_key)
+        if part_node is None:
+            part_node = {"part_letter": part_letter, "part_title": part_title, "titles": []}
+            part_node["_titles_map"] = OrderedDict()
+            parts_map[part_key] = part_node
+
+        # TITLE
+        titles_map = part_node["_titles_map"]
+        title_key = (title_letter, title_title)
+        title_node = titles_map.get(title_key)
+        if title_node is None:
+            title_node = {"title_letter": title_letter, "title_title": title_title, "chapters": []}
+            title_node["_chapters_map"] = OrderedDict()
+            titles_map[title_key] = title_node
+            part_node["titles"].append(title_node)
+
+        # CHAPTER
+        chapters_map = title_node["_chapters_map"]
+        chap_key = (chapter_letter, chapter_title)
+        chap_node = chapters_map.get(chap_key)
+        if chap_node is None:
+            chap_node = {
+                "chapter_letter": chapter_letter,
+                "chapter_title": chapter_title,
+                "sections": [],
+                "articles": [],
+            }
+            chap_node["_sections_map"] = OrderedDict()
+            chapters_map[chap_key] = chap_node
+            title_node["chapters"].append(chap_node)
+
+        # SECTION (optional)
+        sections_map = chap_node["_sections_map"]
+        sec_key = (section_letter, section_title)
+        if section_letter or section_title:
+            sec_node = sections_map.get(sec_key)
+            if sec_node is None:
+                sec_node = {
+                    "section_letter": section_letter,
+                    "section_title": section_title,
+                    "articles": [],
+                }
+                sections_map[sec_key] = sec_node
+                chap_node["sections"].append(sec_node)
+            sec_node["articles"].append({"num": num, "title": title_display})
+        else:
+            chap_node["articles"].append({"num": num, "title": title_display})
+
+    # strip helper maps
+    out: list[dict[str, Any]] = []
+    for _, pnode in parts_map.items():
+        for tnode in pnode.get("titles", []):
+            for chnode in tnode.get("chapters", []):
+                chnode.pop("_sections_map", None)
+            tnode.pop("_chapters_map", None)
+        pnode.pop("_titles_map", None)
+        out.append(pnode)
+    return out
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="fek-extractor",
@@ -80,19 +170,18 @@ def main() -> None:
     p.add_argument("--input", "-i", type=Path, required=True, help="PDF file or directory")
     p.add_argument("--out", "-o", type=Path, default=Path("out.json"), help="Output path")
     p.add_argument("--format", "-f", choices=["json", "csv"], default="json", help="Output format")
-    p.add_argument(
-        "--pattern",
-        action="append",
-        default=None,
-        help="Regex to capture (repeatable). (Currently informational.)",
-    )
     p.add_argument("--no-recursive", action="store_true", help="Disable directory recursion")
+
+    # --debug [PAGE]  -> σκέτο ανάβει debug, με αριθμό περνάει και το debug_pages
     p.add_argument(
         "--debug",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Verbose PDF splitter/debug logs (use --debug / --no-debug).",
+        nargs="?",
+        metavar="PAGE",
+        const=0,
+        type=int,
+        help="Enable debug; optionally pass a page number (e.g. --debug 39).",
     )
+
     p.add_argument(
         "--jobs",
         "-j",
@@ -115,11 +204,27 @@ def main() -> None:
         action="store_true",
         help="Print only the articles map (numeric keys) as JSON.",
     )
+    p.add_argument(
+        "--toc-only",
+        action="store_true",
+        help="Emit only the Table of Contents as JSON (array of parts).",
+    )
 
     args = p.parse_args()
 
+    # Translate --debug into (debug: bool, debug_pages: Optional[int])
+    if args.debug is None:
+        debug = False
+        debug_pages: int | None = None
+    elif args.debug == 0:
+        debug = True
+        debug_pages = None
+    else:
+        debug = True
+        debug_pages = args.debug
+
     # Configure logging level based on --debug
-    get_logger().setLevel(logging.DEBUG if args.debug else logging.INFO)
+    get_logger().setLevel(logging.DEBUG if debug else logging.INFO)
 
     # Collect PDFs
     pdfs = collect_pdfs(args.input, recursive=not args.no_recursive)
@@ -132,7 +237,7 @@ def main() -> None:
     if len(pdfs) == 1 or args.jobs <= 1:
         # Sequential path
         for pdf in pdfs:
-            records.append(_process_pdf(pdf, args.include_metrics, args.debug))
+            records.append(_process_pdf(pdf, args.include_metrics, debug, debug_pages))
     else:
         # Parallel over files; preserve input order in results
         total = len(pdfs)
@@ -141,7 +246,8 @@ def main() -> None:
 
         with ProcessPoolExecutor(max_workers=args.jobs) as ex:
             futures = {
-                ex.submit(_process_pdf, pdf, args.include_metrics, args.debug): pdf for pdf in pdfs
+                ex.submit(_process_pdf, pdf, args.include_metrics, debug, debug_pages): pdf
+                for pdf in pdfs
             }
             for done, fut in enumerate(as_completed(futures), start=1):
                 pdf = futures[fut]
@@ -176,6 +282,25 @@ def main() -> None:
             print("Warning: --articles-only ignores --format=csv; writing JSON.", flush=True)
         write_json(payload, args.out)
         print(f"Wrote articles-only JSON to {args.out}")
+        return
+
+    input_is_dir = args.input.is_dir()
+
+    if args.toc_only:
+        if input_is_dir:
+            payload = []
+            for rec in records:
+                toc = _build_toc_from_articles(rec.get("articles") or {})
+                payload.append(
+                    {"path": rec.get("path"), "filename": rec.get("filename"), "toc": toc}
+                )
+        else:
+            toc = _build_toc_from_articles(records[0].get("articles") or {})
+            payload = toc
+        if args.format == "csv":
+            print("Warning: --toc-only ignores --format=csv; writing JSON.", flush=True)
+        write_json(payload, args.out)
+        print(f"Wrote TOC JSON to {args.out}")
         return
 
     if args.format == "json":

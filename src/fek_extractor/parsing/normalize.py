@@ -79,12 +79,24 @@ def _normalize_known_compounds(text: str) -> str:
     if not text:
         return text
 
-    # κράτος-μέλος family
+    # Always hyphen family
     LEFT = r"(?:κράτος|κράτους|κράτη|κρατών)"
     RIGHT = r"(?:μέλος|μέλους|μέλη|μελών)"
 
     # (a) glued: 'κράτουςμέλους' -> 'κράτους-μέλους'
     text = re.sub(rf"(?i)\b({LEFT})({RIGHT})\b", r"\1-\2", text)
+
+    # Always glued family
+    HYPHENS = r"[\-\u2010\u2011\u2012\u2013\u2014\u2015\u2212\u00AD]"
+    LEFT2 = r"(?:ΑΕ)"  # extensible: e.g., r"(?:ΑΕ|ΙΚΕ)"
+    RIGHT2 = r"(?:ΠΕΥ)"  # extensible: e.g., r"(?:ΠΕΥ|ΕΠ)"
+
+    # ΑΕ-ΠΕΥ (with any hyphen variant, optional spaces) → ΑΕΠΕΥ
+    text = re.sub(
+        rf"(?iu)\b({LEFT2})\s*{HYPHENS}\s*({RIGHT2})\b",
+        r"\1\2",
+        text,
+    )
 
     # (b) any mix of spaces/hyphen-like chars between -> single ASCII hyphen
     text = re.sub(
