@@ -1,7 +1,6 @@
-"""
-Run with:
-    python .\src\fek_extractor\debug\__main__.py \
-        --pdf ".\data\samples\gr-act-2020-4706-4706_2020.pdf" \
+"""Run with:
+    python -m fek_extractor.debug \
+        --pdf "data/samples/gr-act-2020-4706-4706_2020.pdf" \
         --page 39 --check-order
 """
 
@@ -11,8 +10,9 @@ import argparse
 import sys
 from collections.abc import Iterable
 
-from fek_extractor.io.pdf import ColumnExtractor, PageContext, _iter_lines
 from pdfminer.high_level import extract_pages
+
+from fek_extractor.io.pdf import ColumnExtractor, PageContext, _iter_lines
 
 
 def extract_single_page_text(pdf_path: str, page_no: int, debug: bool = True) -> str:

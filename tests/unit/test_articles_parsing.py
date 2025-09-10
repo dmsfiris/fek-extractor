@@ -1,7 +1,9 @@
-# tests/unit/test_articles_parsing.py
+"""Unit tests for article parsing utilities."""
+
 from __future__ import annotations
 
 import pytest
+
 from fek_extractor.parsing.articles import (
     build_articles,
     build_articles_map,

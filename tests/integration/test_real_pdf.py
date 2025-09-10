@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from fek_extractor.core import extract_pdf_info
 
 PDF = Path("data/samples/gr-act-2020-4706-4706_2020.pdf")
