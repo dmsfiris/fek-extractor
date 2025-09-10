@@ -45,7 +45,7 @@ def extract_pdf_info(
     debug_pages: int | None = raw_dp if isinstance(raw_dp, int) and raw_dp > 0 else None
 
     # 1) Extract full text (headers/footers filtered)
-    full_text: str = extract_pdf_text(pdf_path, debug=debug, debug_pages=debug_pages)
+    full_text: str = extract_pdf_text(p, debug=debug, debug_pages=debug_pages)
 
     # Precompute normalized text once (used by decision + metrics)
     text_norm: str = normalize_text(full_text)
@@ -56,7 +56,7 @@ def extract_pdf_info(
     # 2) Build a light "masthead" blob from first couple of pages
     masthead_lines: list[str] = []
     try:
-        for i, layout in enumerate(extract_pages(str(pdf_path))):
+        for i, layout in enumerate(extract_pages(str(p))):
             if not isinstance(layout, LTPage):
                 continue
             if i >= 2:
@@ -92,8 +92,8 @@ def extract_pdf_info(
     # 5) Compose record
     record: dict[str, Any] = {
         "filename": p.name,
-        "path": str(pdf_path),
-        "pages": count_pages(pdf_path),
+        "path": str(p),
+        "pages": count_pages(p),
         **header,
         "articles": articles_ordered,
     }

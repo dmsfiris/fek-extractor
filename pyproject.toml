@@ -52,6 +52,10 @@ python_version = "3.10"
 strict = true
 mypy_path = ["src"]
 
+[[tool.mypy.overrides]]
+module = "pdfminer.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
