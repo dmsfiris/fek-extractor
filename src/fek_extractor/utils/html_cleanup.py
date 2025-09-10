@@ -271,7 +271,7 @@ def tidy_article_html(html: str) -> str:
     if not html or not isinstance(html, str):
         return html or ""
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup: BeautifulSoup = BeautifulSoup(html, "html.parser")
 
     # Use the body if BS4 wrapped our fragment; else use soup itself
     root_pe: PageElement = soup.body if soup.body else soup
