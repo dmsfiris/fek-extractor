@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: If you use this software, please cite it as below.
+title: fek-extractor
+type: software
+authors:
+  - family-names: Sfyris
+    given-names: Dimitrios S.
+    affiliation: AspectSoft
+    # orcid: https://orcid.org/0000-0000-0000-0000   # <- add if you have one
+repository-code: https://github.com/dmsfiris/fek-extractor
+abstract: >
+  Layout- and Greek-aware extractor for Greek Government Gazette (ΦΕΚ) PDFs,
+  producing structured JSON/CSV including metadata and article maps.
+license: Apache-2.0
+version: 0.1.0
+date-released: 2025-09-10
+keywords:
+  - FEK
+  - Government Gazette
+  - Greece
+  - NLP
+  - Information Extraction
+  - PDF
+preferred-citation:
+  type: software
+  title: fek-extractor
+  authors:
+    - family-names: Sfyris
+      given-names: Dimitrios S.
+      affiliation: AspectSoft
+  version: 0.1.0
+  year: 2025
+  url: https://github.com/dmsfiris/fek-extractor
