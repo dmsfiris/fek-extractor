@@ -389,27 +389,6 @@ By contributing you agree to license your work under the project’s **Apache‑
 ## License
 
 This project is licensed under **Apache License 2.0**. See [LICENSE](LICENSE).
-If you prefer a copyleft model (keeping derivatives open), consider re‑licensing as **GPLv3/AGPLv3** or offering **dual‑licensing** (AGPL for community + commercial license via AspectSoft). See below for guidance.
-
-### Picking a license (quick guide)
-
-- **Max adoption, simple** → MIT or **Apache‑2.0** (Apache adds a patent grant and NOTICE).
-- **Keep derivatives open** → **GPLv3** (apps), **AGPLv3** (network services).
-- **File‑level copyleft with easier mixing** → **MPL‑2.0**.
-- **Source‑available (not OSI)** → Business Source License (BUSL‑1.1), SSPL, Polyform (non‑commercial).
-
-> For a project that still offers some protection, **Apache‑2.0** is a great default. If you want stronger reciprocity, choose **AGPLv3** or dual‑license.
-
-**How to apply**
-
-1. Add a `LICENSE` file (done).
-2. Add a `NOTICE` file (done) and keep third‑party attributions.
-3. Optionally add license headers to source files, e.g.:
-
-```python
-# Copyright (c) 2025 Your Name
-# SPDX-License-Identifier: Apache-2.0
-```
 
 ---
 
